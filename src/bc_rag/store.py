@@ -75,19 +75,44 @@ class HybridStore:
             if existing is not None and existing != dense_dim:
                 self.client.delete_collection(self.collection)
             else:
+                self._ensure_compact_storage(info)
                 self.ensure_payload_indexes()
                 return
 
         self.client.create_collection(
             collection_name=self.collection,
             vectors_config={
-                "dense": VectorParams(size=dense_dim, distance=Distance.COSINE),
+                "dense": VectorParams(size=dense_dim, distance=Distance.COSINE, on_disk=True),
             },
             sparse_vectors_config={
                 "bm25": SparseVectorParams(modifier=Modifier.IDF),
             },
+            quantization_config=_scalar_quantization(),
         )
         self.ensure_payload_indexes()
+
+    def _ensure_compact_storage(self, info: Any) -> None:
+        """Move full dense vectors to disk and keep int8 copies in RAM.
+
+        Collections created before this setting get migrated in place. Qdrant
+        rebuilds the segments in the background; no reindex is needed.
+        """
+        if self.read_only:
+            return
+        from qdrant_client.models import VectorParamsDiff
+
+        params = info.config.params
+        vectors = params.vectors
+        dense = vectors.get("dense") if isinstance(vectors, dict) else None
+        on_disk = bool(getattr(dense, "on_disk", False))
+        quantized = info.config.quantization_config is not None
+        if on_disk and quantized:
+            return
+        self.client.update_collection(
+            collection_name=self.collection,
+            vectors_config=None if on_disk else {"dense": VectorParamsDiff(on_disk=True)},
+            quantization_config=None if quantized else _scalar_quantization(),
+        )
 
     def recreate_collection(self, dense_dim: int) -> None:
         if self.client.collection_exists(self.collection):
@@ -247,6 +272,19 @@ def _payload_filter(
     if not must:
         return None
     return Filter(must=must)
+
+
+def _scalar_quantization():
+    """int8 copies of the dense vectors, 4x smaller than float32, pinned in RAM."""
+    from qdrant_client.models import (
+        ScalarQuantization,
+        ScalarQuantizationConfig,
+        ScalarType,
+    )
+
+    return ScalarQuantization(
+        scalar=ScalarQuantizationConfig(type=ScalarType.INT8, quantile=0.99, always_ram=True)
+    )
 
 
 def _point_id(chunk: Chunk) -> str:
