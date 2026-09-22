@@ -1,0 +1,153 @@
+# {{ spec.info.title }}
+
+{{ spec.info.description }}
+
+# Base URL
+
+
+| URL | Description |
+|-----|-------------|
+{% for server in spec.servers or [] -%}
+| {{ server.url }} | {{ server.description }} |
+{% endfor %}
+
+{% if spec.components and spec.components.securitySchemes -%}
+
+# Authentication
+
+{% with root = spec.components -%}
+{% include './_security_scheme.md.j2' -%}
+{% endwith -%}
+{% endif -%}
+
+# APIs
+
+{% for path, methods in (spec.paths or {}).items() -%}
+
+{% for method, operation in methods.items()
+   if method in ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace']
+      and operation is mapping -%}
+## {{ method.upper() }} {{ path }}
+
+{% if operation.operationId -%}
+**Operation ID**: `{{ operation.operationId }}`
+{% endif %}
+{% if operation.tags -%}
+**Tags**: {{ operation.tags[0] }}
+{% endif %}
+
+{{ operation.summary }}
+
+{% if operation.description and operation.description != operation.summary -%}
+{{ operation.description }}
+{% endif %}
+
+{% if operation.parameters -%}
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+{% for param in operation.parameters -%}
+{% set param_obj = ref_to_schema(param) -%}
+| {{ param_obj.name }} | {{ param_obj.schema.type if param_obj.schema is defined else '' }} | {{ param_obj.required }} | {{ param_obj.description }} |
+{% endfor -%}
+{% endif %}
+
+{% if operation.requestBody -%}
+
+### Request Body
+
+{% set content = operation.requestBody.content -%}
+{% include './_content.md.j2' %}
+
+{% endif -%}
+
+{% if operation.responses is mapping -%}
+### Responses
+
+{% for status_code, response in operation.responses.items() if response is mapping -%}
+
+#### {{ status_code }}
+
+{% if response.description %}
+{{ response.description }}
+{% endif %}
+
+{% set content = response.content -%}
+{% include './_content.md.j2' %}
+
+{% endfor -%}
+{% endif -%}
+{% endfor -%}
+{% endfor -%}
+
+{% if spec.webhooks -%}
+
+# Webhooks
+
+{% for path, methods in spec.webhooks.items() -%}
+
+{% for method, operation in methods.items()
+   if method in ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace']
+      and operation is mapping -%}
+## {{ method.upper() }} {{ path }}
+
+{% if operation.operationId -%}
+**Operation ID**: `{{ operation.operationId }}`
+{% endif %}
+{% if operation.tags -%}
+**Tags**: {{ operation.tags[0] }}
+{% endif %}
+
+{{ operation.summary }}
+
+{% if operation.description and operation.description != operation.summary -%}
+{{ operation.description }}
+{% endif %}
+
+{% if operation.requestBody -%}
+
+### Request Body
+
+{% set content = operation.requestBody.content -%}
+{% include './_content.md.j2' %}
+
+{% endif -%}
+
+{% if operation.responses is mapping -%}
+### Responses
+
+{% for status_code, response in operation.responses.items() if response is mapping -%}
+
+#### {{ status_code }}
+
+{% if response.description %}
+{{ response.description }}
+{% endif %}
+
+{% set content = response.content -%}
+{% include './_content.md.j2' %}
+
+{% endfor -%}
+{% endif -%}
+{% endfor -%}
+{% endfor -%}
+{% endif -%}
+
+{% if spec.components and spec.components.schemas -%}
+
+# Components
+
+{% for schema_name, schema in spec.components.schemas.items() %}
+
+## {{ schema_name }}
+
+{% if schema.description %}
+{{ schema.description }}
+{% endif %}
+
+{% include './_object_schema.md.j2' -%}
+{% endfor -%}
+
+{% endif -%}
