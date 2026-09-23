@@ -1,19 +1,28 @@
-"""One stdio MCP server for every cataloged project.
+"""One MCP server for every cataloged project.
 
-Agents register `bc-rag mcp` once. `search` takes an optional project name.
-Omit it and the query runs across every living root in `~/.bc-rag/catalog.json`.
+`bc-rag mcp` speaks over stdin for a single chat.
+`bc-rag mcp --http` listens on 127.0.0.1 so every chat shares that process.
+`search` takes an optional project name. Omit it and the query runs across
+every living root in `~/.bc-rag/catalog.json`.
 """
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from bc_rag.catalog import living_projects
+from bc_rag.defaults import MCP_HTTP_HOST, MCP_HTTP_PATH, MCP_HTTP_PORT
 from bc_rag.query import search_projects
 from bc_rag.store import Hit
 
 
-def run_mcp() -> None:
+def run_mcp(
+    *,
+    http: bool = False,
+    host: str = MCP_HTTP_HOST,
+    port: int = MCP_HTTP_PORT,
+) -> None:
     from mcp.server import MCPServer
 
     mcp = MCPServer(
@@ -96,6 +105,23 @@ def run_mcp() -> None:
             "groups": [{"group": name, "points": count} for name, count in groups],
         }
 
+    if http:
+        if not host or host.strip() != host or any(ch.isspace() for ch in host):
+            raise ValueError(f"invalid mcp host: {host!r}")
+        if port < 1 or port > 65535:
+            raise ValueError(f"invalid mcp port: {port}")
+        url = f"http://{host}:{port}{MCP_HTTP_PATH}"
+        print(f"bc-rag mcp {url}", file=sys.stderr, flush=True)
+        mcp.run(
+            transport="streamable-http",
+            host=host,
+            port=port,
+            streamable_http_path=MCP_HTTP_PATH,
+            # Each chat is its own request. No session table to leak when a chat closes.
+            stateless_http=True,
+            json_response=True,
+        )
+        return
     mcp.run(transport="stdio")
 
 

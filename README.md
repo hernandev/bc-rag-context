@@ -62,7 +62,8 @@ bc-rag watch [folder]         # index, then rewrite only files that change or di
 bc-rag status [folder]
 bc-rag projects list          # catalog used by MCP
 bc-rag projects forget NAME
-bc-rag mcp                    # one stdio MCP server for every cataloged project
+bc-rag mcp                    # stdio, one chat
+bc-rag mcp --http             # one shared listener on 127.0.0.1:32323/mcp
 ```
 
 `bc-rag index` hashes each file. A later run embeds only files whose bytes changed, and deletes paths that vanished.
@@ -80,14 +81,20 @@ bc-rag index /path/to/portal
 
 Each successful index registers the root in `~/.bc-rag/catalog.json`.
 
-Register **one** MCP server in Cursor, Claude, or any local agent:
+Start one shared listener, then point every client at that address. Each chat then connects over HTTP instead of starting its own process.
+
+```bash
+bc-rag mcp --http
+```
+
+That listens on `http://127.0.0.1:32323/mcp`. A launchd job for the same command is `contrib/launchd/ai.pleinair.bc-rag.mcp.plist`.
 
 ```json
 {
   "mcpServers": {
     "bc-rag": {
-      "command": "bc-rag",
-      "args": ["mcp"]
+      "type": "http",
+      "url": "http://127.0.0.1:32323/mcp"
     }
   }
 }

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.pleinair.bc-rag.mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/hernandev/code/pleinair/bc-rag-context/contrib/launchd/bc-rag-mcp-http.zsh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/hernandev/code/pleinair/bc-rag-context</string>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/hernandev/.bc-rag/mcp-http.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/hernandev/.bc-rag/mcp-http.log</string>
+</dict>
+</plist>

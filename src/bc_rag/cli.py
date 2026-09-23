@@ -17,6 +17,7 @@ from rich.table import Table
 from bc_rag import __version__
 from bc_rag.catalog import forget_project, living_projects, project_store_dir, register_project
 from bc_rag.config import config_path, dump_default_config, load_config, with_jina_api
+from bc_rag.defaults import MCP_HTTP_HOST, MCP_HTTP_PORT
 from bc_rag.discover import debug_resolve_groups, iter_source_files
 from bc_rag.indexer import Indexer
 from bc_rag.manifest import load_manifest
@@ -1009,8 +1010,21 @@ def split_md_entry() -> None:
 
 
 @app.command("mcp")
-def mcp_cmd() -> None:
-    """Run the stdio MCP server for local agents. One process covers every cataloged project."""
+def mcp_cmd(
+    http: Annotated[
+        bool,
+        typer.Option("--http", help="Listen on HTTP so every chat shares one process."),
+    ] = False,
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind address for --http. Stays on this machine."),
+    ] = MCP_HTTP_HOST,
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Port for --http."),
+    ] = MCP_HTTP_PORT,
+) -> None:
+    """Run the MCP server. Default is stdio. --http is one shared listener."""
     from bc_rag.mcp_server import run_mcp
 
-    run_mcp()
+    run_mcp(http=http, host=host, port=port)

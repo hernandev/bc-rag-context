@@ -9,6 +9,10 @@ COLLECTION_NAME = "chunks"
 QDRANT_HTTP_URL = "http://127.0.0.1:32321"
 QDRANT_HTTP_PORT = 32321
 QDRANT_GRPC_PORT = 32322
+# One shared MCP process. Chats connect here instead of spawning stdio.
+MCP_HTTP_HOST = "127.0.0.1"
+MCP_HTTP_PORT = 32323
+MCP_HTTP_PATH = "/mcp"
 QDRANT_DOCKER_CONTEXT = "orbstack"
 QDRANT_COMPOSE_PROJECT = "bc-rag"
 QDRANT_IMAGE = "qdrant/qdrant:v1.19.1"
