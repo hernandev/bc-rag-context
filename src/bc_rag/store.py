@@ -1,4 +1,4 @@
-"""Qdrant local (path) store. Named dense vector + BM25 sparse, fused with RRF."""
+"""Qdrant store. Search is the dense vector only. BM25 is stored and not queried."""
 
 from __future__ import annotations
 
@@ -183,28 +183,58 @@ class HybridStore:
         self,
         *,
         dense: list[float],
-        sparse: SparseVec,
+        sparse: SparseVec | None = None,
         prefetch: int,
         limit: int,
         groups: list[str] | None = None,
         tags: list[str] | None = None,
     ) -> list[Hit]:
-        from qdrant_client.models import Fusion, FusionQuery, Prefetch, SparseVector
+        del sparse, prefetch
+        self.ensure_payload_indexes()
+        query_filter = _payload_filter(groups=groups, tags=tags)
+        response = self.client.query_points(
+            collection_name=self.collection,
+            query=dense,
+            using="dense",
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+        )
+        hits: list[Hit] = []
+        for point in response.points:
+            payload = point.payload or {}
+            hits.append(
+                Hit(
+                    score=float(point.score),
+                    path=str(payload.get("path", "")),
+                    language=str(payload.get("language", "")),
+                    kind=str(payload.get("kind", "")),
+                    symbol=payload.get("symbol"),
+                    heading_path=payload.get("heading_path"),
+                    start_line=int(payload.get("start_line") or 0),
+                    end_line=int(payload.get("end_line") or 0),
+                    text=str(payload.get("text", "")),
+                    payload=payload,
+                )
+            )
+        return hits
+
+    def query_sparse(
+        self,
+        *,
+        sparse: SparseVec,
+        limit: int,
+        groups: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> list[Hit]:
+        from qdrant_client.models import SparseVector
 
         self.ensure_payload_indexes()
         query_filter = _payload_filter(groups=groups, tags=tags)
         response = self.client.query_points(
             collection_name=self.collection,
-            prefetch=[
-                Prefetch(query=dense, using="dense", limit=prefetch, filter=query_filter),
-                Prefetch(
-                    query=SparseVector(indices=sparse.indices, values=sparse.values),
-                    using="bm25",
-                    limit=prefetch,
-                    filter=query_filter,
-                ),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
+            query=SparseVector(indices=sparse.indices, values=sparse.values),
+            using="bm25",
             query_filter=query_filter,
             limit=limit,
             with_payload=True,

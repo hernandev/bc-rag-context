@@ -30,7 +30,8 @@ def run_mcp(
         instructions=(
             "Search local source and docs indexed by bc-rag-context. "
             "Call list_projects to see cataloged repos, then search. "
-            "Pass project to restrict to one repo, or omit it to search all."
+            "Pass project to restrict to one repo, or omit it to search all. "
+            "search is dense then rerank. search_sparse is BM25 only."
         ),
     )
 
@@ -47,7 +48,7 @@ def run_mcp(
         groups: list[str] | None = None,
         tags: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Hybrid semantic + BM25 search over indexed project context.
+        """Dense search, then rerank. Does not use BM25.
 
         Args:
             query: Natural language or identifier search.
@@ -63,6 +64,43 @@ def run_mcp(
             use_rerank=True,
             groups=groups,
             tags=tags,
+        )
+        return {
+            "query": result.query,
+            "project": project,
+            "groups": groups,
+            "tags": tags,
+            "hits": [_hit_dict(hit) for hit in result.hits],
+        }
+
+    @mcp.tool()
+    def search_sparse(
+        query: str,
+        project: str | None = None,
+        limit: int = 8,
+        groups: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """BM25 keyword search only. No dense vector and no rerank.
+
+        Use for an identifier, a path fragment, or an exact error string.
+        Do not use for a question about what the code means.
+
+        Args:
+            query: Tokens to match.
+            project: Optional catalog name or absolute root. Omit to search all.
+            limit: Maximum hits to return.
+            groups: Optional config group names. Only hits from these groups.
+            tags: Sidecar filters as key:value (vendor:olo). All must match.
+        """
+        result = search_projects(
+            query,
+            project=project,
+            limit=limit,
+            use_rerank=False,
+            groups=groups,
+            tags=tags,
+            sparse=True,
         )
         return {
             "query": result.query,

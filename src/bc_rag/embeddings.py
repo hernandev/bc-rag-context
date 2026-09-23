@@ -82,8 +82,10 @@ class Embedder:
             dense = self._jina_embed([text], query=True)[0]
         else:
             dense = next(self._dense.query_embed([text])).tolist()
-        sparse = _to_sparse(next(self._sparse.query_embed([text])))
-        return dense, sparse
+        return dense, self.embed_sparse_query(text)
+
+    def embed_sparse_query(self, text: str) -> SparseVec:
+        return _to_sparse(next(self._sparse.query_embed([text])))
 
     def _jina_embed(self, texts: list[str], *, query: bool) -> list[list[float]]:
         from bc_rag.jina_api import embed_texts

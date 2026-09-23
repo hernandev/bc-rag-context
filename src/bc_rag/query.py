@@ -1,4 +1,4 @@
-"""Hybrid retrieve, then optional cross-encoder rerank."""
+"""Dense retrieve, then optional cross-encoder rerank."""
 
 from __future__ import annotations
 
@@ -32,15 +32,14 @@ def search(
     retrieve = config.retrieve
     final_limit = limit if limit is not None else retrieve.limit
     do_rerank = retrieve.rerank if use_rerank is None else use_rerank
-    dense, sparse = embedder.embed_query(query)
-    prefetch = max(retrieve.prefetch, final_limit)
+    dense, _sparse = embedder.embed_query(query)
+    candidate_limit = max(retrieve.prefetch, final_limit)
     if do_rerank and reranker is not None:
-        prefetch = max(prefetch, final_limit * 4)
+        candidate_limit = max(candidate_limit, final_limit * 4)
     hits = store.query(
         dense=dense,
-        sparse=sparse,
-        prefetch=prefetch,
-        limit=prefetch if (do_rerank and reranker is not None) else final_limit,
+        prefetch=candidate_limit,
+        limit=candidate_limit if (do_rerank and reranker is not None) else final_limit,
         groups=groups,
         tags=tags,
     )
@@ -56,6 +55,28 @@ def search(
     return QueryResult(query=query, hits=hits)
 
 
+def search_sparse(
+    *,
+    query: str,
+    config: RagConfig,
+    embedder: Embedder,
+    store: HybridStore,
+    limit: int | None = None,
+    groups: list[str] | None = None,
+    tags: list[str] | None = None,
+) -> QueryResult:
+    """BM25 only. No dense vector and no rerank."""
+    final_limit = limit if limit is not None else config.retrieve.limit
+    sparse = embedder.embed_sparse_query(query)
+    hits = store.query_sparse(
+        sparse=sparse,
+        limit=final_limit,
+        groups=groups,
+        tags=tags,
+    )
+    return QueryResult(query=query, hits=hits)
+
+
 _embedder_cache: dict[tuple[str, str, bool], Embedder] = {}
 _reranker_cache: dict[tuple[str, bool], Reranker] = {}
 
@@ -68,6 +89,7 @@ def search_projects(
     use_rerank: bool = True,
     groups: list[str] | None = None,
     tags: list[str] | None = None,
+    sparse: bool = False,
 ) -> QueryResult:
     """Search one cataloged project, or all of them through a single MCP."""
     entries = living_projects()
@@ -90,13 +112,14 @@ def search_projects(
             use_rerank=False,
             groups=groups,
             tags=tags,
+            sparse=sparse,
         )
         pooled.extend(hits)
         if ranker is not None:
             reranker = ranker
         final_limit = limit if limit is not None else cfg.retrieve.limit
 
-    if use_rerank and reranker is not None and pooled:
+    if not sparse and use_rerank and reranker is not None and pooled:
         scores = reranker.rerank(query, [hit.text for hit in pooled])
         ranked = sorted(zip(scores, pooled, strict=True), key=lambda row: row[0], reverse=True)
         hits = []
@@ -117,6 +140,7 @@ def _search_entry(
     use_rerank: bool,
     groups: list[str] | None = None,
     tags: list[str] | None = None,
+    sparse: bool = False,
 ) -> tuple[list[Hit], RagConfig, Reranker | None]:
     root = Path(entry.root)
     config, _ = load_config(root)
@@ -138,17 +162,28 @@ def _search_entry(
             reranker = _reranker_for(
                 config.embed.active_rerank(), jina_api=config.embed.jina_api
             )
-        result = search(
-            query=query,
-            config=config,
-            embedder=embedder,
-            store=store,
-            reranker=reranker,
-            limit=limit,
-            use_rerank=use_rerank,
-            groups=groups,
-            tags=tags,
-        )
+        if sparse:
+            result = search_sparse(
+                query=query,
+                config=config,
+                embedder=embedder,
+                store=store,
+                limit=limit,
+                groups=groups,
+                tags=tags,
+            )
+        else:
+            result = search(
+                query=query,
+                config=config,
+                embedder=embedder,
+                store=store,
+                reranker=reranker,
+                limit=limit,
+                use_rerank=use_rerank,
+                groups=groups,
+                tags=tags,
+            )
         for hit in result.hits:
             hit.project = entry.name
         return result.hits, config, reranker if config.retrieve.rerank else None

@@ -21,7 +21,7 @@ from bc_rag.defaults import MCP_HTTP_HOST, MCP_HTTP_PORT
 from bc_rag.discover import debug_resolve_groups, iter_source_files
 from bc_rag.indexer import Indexer
 from bc_rag.manifest import load_manifest
-from bc_rag.query import search
+from bc_rag.query import search, search_sparse
 from bc_rag.runtime import open_session, resolve_root
 from bc_rag.watch import WatchSession
 
@@ -522,6 +522,10 @@ def query(
     no_rerank: Annotated[
         bool, typer.Option("--no-rerank", help="Skip the cross-encoder rerank pass.")
     ] = False,
+    sparse: Annotated[
+        bool,
+        typer.Option("--sparse", help="BM25 only. No dense vector and no rerank."),
+    ] = False,
     jina: Annotated[
         bool, typer.Option("--jina", help="Query the Jina API index.")
     ] = False,
@@ -545,7 +549,7 @@ def query(
         ),
     ] = None,
 ) -> None:
-    """Semantic + BM25 hybrid search over the index."""
+    """Dense search, then rerank. --sparse is BM25 only."""
     text = " ".join(q).strip()
     if not text:
         err.print("[red]empty query[/red]")
@@ -574,17 +578,28 @@ def query(
         if session.store.count() == 0:
             err.print("[red]empty index[/red] run `bc-rag index` first")
             raise typer.Exit(code=1)
-        result = search(
-            query=text,
-            config=session.config,
-            embedder=session.embedder,
-            store=session.store,
-            reranker=session.reranker,
-            limit=limit,
-            use_rerank=use_rerank,
-            groups=group,
-            tags=tag,
-        )
+        if sparse:
+            result = search_sparse(
+                query=text,
+                config=session.config,
+                embedder=session.embedder,
+                store=session.store,
+                limit=limit,
+                groups=group,
+                tags=tag,
+            )
+        else:
+            result = search(
+                query=text,
+                config=session.config,
+                embedder=session.embedder,
+                store=session.store,
+                reranker=session.reranker,
+                limit=limit,
+                use_rerank=use_rerank,
+                groups=group,
+                tags=tag,
+            )
     finally:
         session.close()
     _print_query_result(result, json_out=json_out)

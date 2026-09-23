@@ -103,7 +103,9 @@ That listens on `http://127.0.0.1:32323/mcp`. A launchd job for the same command
 Tools:
 
 - `list_projects`
-- `search(query, project?, limit?)` — omit `project` to search every living catalog entry
+- `search` — dense vectors, then rerank. Omit `project` to search every living catalog entry.
+- `search_sparse` — BM25 only. No dense vector and no rerank.
+- `list_tags`
 
 You do not register one MCP server per repository.
 
@@ -140,9 +142,9 @@ Default dense model: `jinaai/jina-embeddings-v2-base-en` (768 dimensions, 8192-t
 
 Default reranker: `jinaai/jina-reranker-v1-turbo-en` (8k context, so a whole operation can be scored).
 
-A query pulls 80 dense + 80 BM25 candidates, fuses them with Reciprocal Rank Fusion, then the reranker reorders.
+`search` pulls dense candidates, then the reranker reorders them.
 
-That is the path for "I do not know what they called it."
+`search_sparse` is BM25 only. No dense vector and no rerank. That is the path for an identifier or an exact error string.
 
 ## Scale this is built for
 
