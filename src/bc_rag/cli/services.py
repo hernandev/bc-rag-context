@@ -108,12 +108,13 @@ def _qdrant_detail() -> tuple[str, str]:
     return state, detail
 
 
-def _rows() -> list[dict]:
+def _rows(*, starting: bool = False) -> list[dict]:
+    """One row per service. `starting`: the supervisor has not reported its children yet."""
     from bc_rag.services.logs import log_size
-    from bc_rag.services.state import load_desired, log_path, read_runtime
+    from bc_rag.services.state import STOPPED, load_desired, log_path, read_runtime
     from bc_rag.services.supervisor import supervisor_running
 
-    running = supervisor_running()
+    running = supervisor_running() and not starting
     runtime = read_runtime() if running else {}
     children = runtime.get("children") or {}
     desired = load_desired()
@@ -133,6 +134,9 @@ def _rows() -> list[dict]:
     for name in ("indexer", "mcp"):
         row = children.get(name) or {}
         state = row.get("state") if running else "stopped"
+        if starting and desired.services[name].state != STOPPED:
+            # supervisor.json is empty or an earlier supervisor's; it starts this one next.
+            state = "starting"
         detail = _indexer_detail() if name == "indexer" else _mcp_detail(row)
         if row.get("reason") and name == "indexer":
             detail = f"{row['reason']}; {detail}"
@@ -157,27 +161,28 @@ def services_list(
 ) -> None:
     """Show each service, its state, pid, and log."""
     from bc_rag.services.state import read_runtime, source_fingerprint
-    from bc_rag.services.supervisor import supervisor_running
+    from bc_rag.services.supervisor import starting_pid, supervisor_running
     from bc_rag.usersettings import autostart_enabled
 
     running = supervisor_running()
-    runtime = read_runtime() if running else {}
-    rows = _rows()
+    starting = starting_pid() if running else None
+    # a starting supervisor has not written supervisor.json; what is there is stale.
+    runtime = read_runtime() if running and starting is None else {}
+    rows = _rows(starting=starting is not None)
+    code = None
+    if running and starting is None:
+        code = "current" if runtime.get("fingerprint") == source_fingerprint() else "old"
+    autostart = f"autostart {'on' if autostart_enabled() else 'off'}"
     if json_out:
         console.print_json(
             json.dumps(
                 {
                     "supervisor": {
                         "running": running,
-                        "pid": runtime.get("pid"),
+                        "starting": starting is not None,
+                        "pid": starting if starting is not None else runtime.get("pid"),
                         "started_at": runtime.get("started_at"),
-                        "code": (
-                            "current"
-                            if runtime.get("fingerprint") == source_fingerprint()
-                            else "old"
-                        )
-                        if running
-                        else None,
+                        "code": code,
                     },
                     "autostart": autostart_enabled(),
                     "services": rows,
@@ -185,14 +190,15 @@ def services_list(
             )
         )
         return
-    if running:
-        code = "current" if runtime.get("fingerprint") == source_fingerprint() else "old"
+    if starting is not None:
+        title = f"supervisor pid {starting}  starting  {autostart}"
+    elif running:
         title = (
             f"supervisor pid {runtime.get('pid')}  started {_ago(runtime.get('started_at', ''))}"
-            f"  code {code}  autostart {'on' if autostart_enabled() else 'off'}"
+            f"  code {code}  {autostart}"
         )
     else:
-        title = f"supervisor not running  autostart {'on' if autostart_enabled() else 'off'}"
+        title = f"supervisor not running  {autostart}"
     table = Table(title=title)
     for column in ("service", "state", "pid", "since", "detail", "log"):
         table.add_column(column)

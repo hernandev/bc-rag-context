@@ -244,10 +244,12 @@ def status(
         table.add_row("config error", problem)
     if state.running:
         table.add_row("indexing now", f"since {state.last_start}  (pid {state.pid})")
-    table.add_row("last index", last)
+    # schedule.json is written by the indexer service only; a manual run shows in
+    # the spaces table's `indexed` column instead.
+    table.add_row("last background run", last)
     if state.error:
         table.add_row("last error", state.error)
-    table.add_row("next index", next_run)
+    table.add_row("next background run", next_run)
     table.add_row("store", str(project_store_dir(entry.name)))
     console.print(table)
     spaces = Table(title="spaces")

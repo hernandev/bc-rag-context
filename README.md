@@ -28,7 +28,7 @@ The project is **bc-rag-context**. The command is **bc-rag**.
 12. [Services](#12-services)
 13. [Background indexing](#13-background-indexing)
 14. [MCP for Claude](#14-mcp-for-claude)
-15. [Settings](#15-settings)
+15. [Config](#15-config)
 16. [Environment variables](#16-environment-variables)
 17. [Troubleshooting](#17-troubleshooting)
 18. [Scale and limits](#18-scale-and-limits)
@@ -59,7 +59,7 @@ Put `bin/` on your `PATH`. `bin/bc-rag` runs the command from this checkout and 
 export PATH="/path/to/bc-rag-context/bin:$PATH"
 ```
 
-The first `bc-rag` command writes `~/.bc-rag/config` with the default settings (see [Settings](#15-settings)). It prints one dim line when it does.
+The first `bc-rag` command writes `~/.bc-rag/config` with the default settings (see [Config](#15-config)). It prints one dim line when it does.
 
 ---
 
@@ -496,7 +496,7 @@ Commands:
 - A stopped service **stays stopped**, across commands and restarts, until you start it. `services stop indexer` pauses background indexing while MCP keeps serving.
 - `bc-rag services run NAME` runs one service in the foreground with its log on screen, for debugging. It refuses while the supervisor already runs that service.
 
-**Autostart.** The commands that need the index (`project index build`, `watch`, `search`, `show`, `facets`, `delete`) start the supervisor when it is not running, wait up to 30 seconds for Qdrant, and replace a supervisor that runs older bc-rag code. They never start a service you stopped. Turn this off with `bc-rag settings set autostart false`, or for one command with `BC_RAG_AUTOSTART=false`.
+**Autostart.** The commands that need the index (`index`, `search`, `status`, `facets`, `project clear`) start the supervisor when it is not running, wait up to 30 seconds for Qdrant, and replace a supervisor that runs older bc-rag code. They never start a service you stopped. Turn this off with `bc-rag config set autostart false --global`, or for one command with `BC_RAG_AUTOSTART=false`.
 
 **Environment.** The services inherit the environment of the shell that started the supervisor (`PATH` for `node` and `docker`, and API keys you keep in environment variables). `bc-rag services restart` without a name starts a new supervisor from your current shell. `services restart NAME` restarts one service under the supervisor's existing environment.
 
@@ -516,7 +516,7 @@ docker run -d --name bc-rag-qdrant --label bc-rag=qdrant --restart unless-stoppe
 
 It uses your current Docker context unless the setting `docker-context` names one. A container named `bc-rag-qdrant` that bc-rag did not create (no `bc-rag=qdrant` label) is reported and never touched. `services start qdrant --recreate` replaces the container with the pinned image; the volume, and so the data, is kept.
 
-**Your own Qdrant.** `bc-rag settings set qdrant external`, `settings set qdrant-url https://...`, and, when it needs one, `settings set qdrant-api-key ...`. bc-rag then never calls Docker.
+**Your own Qdrant.** `bc-rag config set qdrant external --global`, `config set qdrant-url https://... --global`, and, when it needs one, `config set qdrant-api-key ... --global`. bc-rag then never calls Docker.
 
 **Logs.** `~/.bc-rag/logs/supervisor.log`, `indexer.log`, and `mcp.log`. Each rotates at 10 MB and keeps two older copies. The container's log is `docker logs bc-rag-qdrant`.
 
@@ -526,20 +526,24 @@ It uses your current Docker context unless the setting `docker-context` names on
 
 ## 13. Background indexing
 
-Background indexing is off for a project until it has an interval. There is no built-in interval.
+Background indexing is off for a project until it has an interval, the config key `every`. There is no built-in interval. The first of these that has a value wins:
 
-1. **Team default:** `"schedule": { "every": "15m" }` in `.bc-rag.json`.
-2. **Your override:** `bc-rag project set every 5m` stores your interval in the registry, or `bc-rag project set every off` to turn it off for you. `bc-rag project unset every` follows the team default again.
+1. **Yours for this project:** `bc-rag config set every 5m` inside the project (or with `--project NAME`), stored in the registry. `off` turns it off for you. `bc-rag config unset every` drops it.
+2. **Team default:** `"schedule": { "every": "15m" }` in `.bc-rag.json`.
+3. **Yours for every project:** `bc-rag config set every 30m --global`, stored in `~/.bc-rag/config`.
+
+`bc-rag status` and `bc-rag config get every` print the value and where it comes from:
 
 ```text
-every  5m   (your override; project default 15m)
-every  15m  (project default)
-every  none (no schedule; set schedule.every in .bc-rag.json or run bc-rag project set every 10m)
+every  5m   (you, this project)
+every  15m  (.bc-rag.json)
+every  30m  (you, every project)
+every  none (not set; bc-rag config set every 10m)
 ```
 
-The indexer service indexes one project at a time. A project's next run is due one interval after its last run finished, so runs never overlap and restarting the services never triggers an extra run. `project show` prints the last and next run, and `services list` shows what the indexer is doing.
+The indexer service indexes one project at a time. A project's next run is due one interval after its last run finished, so runs never overlap and restarting the services never triggers an extra run. `bc-rag status` prints the last and next run, and `services list` shows what the indexer is doing.
 
-A project that is being indexed by another command (for example a manual `project index build`) is skipped until its next due time.
+A project that is being indexed by another command (for example a manual `bc-rag index`) is skipped until its next due time.
 
 ---
 
@@ -594,7 +598,21 @@ Error executing tool search: ValueError: unknown project: nope. Registered proje
 
 ---
 
-## 15. Settings
+## 15. Config
+
+`bc-rag config` works like `git config` and `npm config`:
+
+- Without a flag, it works on **your settings for this project** (the project named by `--project` or `--root`, else the one that holds the current folder). They live in the project's row of `~/.bc-rag/catalog.json`, outside the repo.
+- `--global` works on `~/.bc-rag/config`, shared by every project.
+- Reading without a flag shows the value in effect and where it comes from.
+
+Only `every` can be set for one project. Every other key applies to every project, so it needs `--global`:
+
+```text
+autostart applies to every project. Add --global to set it in ~/.bc-rag/config.
+```
+
+`config` never writes `.bc-rag.json`, the same way `npm config` never writes `package.json`.
 
 `~/.bc-rag/config` is a JSON file readable only by you (mode 0600). Every command fills in the missing non-secret settings with their defaults.
 
@@ -607,13 +625,15 @@ Error executing tool search: ValueError: unknown project: nope. Registered proje
 | `qdrant-url` | `http://127.0.0.1:32321` | no | `BC_RAG_QDRANT_URL` | Qdrant's HTTP URL. |
 | `qdrant-api-key` | | yes | `QDRANT_API_KEY` | Sent as the `api-key` header, for a Qdrant that asks for one. |
 | `docker-context` | empty | no | `BC_RAG_DOCKER_CONTEXT` | Docker context for the container. Empty means the current one. |
+| `every` | none | no | | Background indexing interval, like `15m`, or `off`. Also settable per project (section 13). |
 
 Where a value comes from:
 
 - A secret: the file first, then its environment variable.
+- `every`: yours for this project, then `.bc-rag.json`, then the file (section 13).
 - Any other setting: its environment variable first, then the file, then the default. The file always holds these keys, so the environment variable is a one-shot override.
 
-`settings list` shows every value with its source, secrets masked. `settings get KEY --reveal` prints a secret in full. `settings set` validates the value: `autostart` takes true/false/on/off/yes/no/1/0, `qdrant` takes `docker` or `external`, `qdrant-url` must start with `http://` or `https://`.
+`config list` shows every value with its source, secrets masked. `config get KEY --reveal` prints a secret in full. `config set` validates the value: `autostart` takes true/false/on/off/yes/no/1/0, `qdrant` takes `docker` or `external`, `qdrant-url` must start with `http://` or `https://`, `every` takes a duration like `10m` or `off`.
 
 ---
 
@@ -624,7 +644,7 @@ Where a value comes from:
 | `BC_RAG_HOME` | Use this folder instead of `~/.bc-rag`. |
 | `BC_RAG_AUTOSTART`, `BC_RAG_DAEMON` | `false` turns autostart off for one command. |
 | `BC_RAG_QDRANT`, `BC_RAG_QDRANT_URL`, `BC_RAG_DOCKER_CONTEXT`, `QDRANT_API_KEY` | Override the matching setting. |
-| `VOYAGE_AI_API_KEY` (or `VOYAGE_API_KEY`), `JINA_API_KEY` | API keys, when the settings file has none. |
+| `VOYAGE_AI_API_KEY` (or `VOYAGE_API_KEY`), `JINA_API_KEY` | API keys, when `~/.bc-rag/config` has none. |
 | `FASTEMBED_CACHE_PATH` (or `BC_RAG_MODELS`) | Use this folder instead of `~/.cache/bc-rag/fastembed` for local models. |
 
 ---
@@ -636,9 +656,9 @@ Where a value comes from:
 - **`groupsCommand exited 1: ...`** The message carries the program's own error output. For example, an Nx-based script can fail when a long-running Nx daemon's socket path is too long; stop the Nx daemon (`nx daemon --stop`) or make the script read the workspace files directly.
 - **`mcp service already runs on 127.0.0.1:32323`** Something already listens on the port: usually the supervised mcp service. `bc-rag services stop mcp` before `services run mcp`, or find the owner with `lsof -nP -iTCP:32323 -sTCP:LISTEN`.
 - **`qdrant unreachable at ...`** `bc-rag services start qdrant`. With `qdrant=external`, check `qdrant-url` and `qdrant-api-key`.
-- **`empty index. Run bc-rag project index build first.`** Nothing is stored in that space yet, or its collection changed (section 7).
+- **`empty index. Run bc-rag index first.`** Nothing is stored in that space yet, or its collection changed (section 7).
 - **An index run that did less than expected.** Read `~/.bc-rag/{name}/index.jsonl`: one JSON line per event, including `error`, `skip_large`, `empty`, `skip_hash` (its `by` says `stat` or `hash`), `file_complete`, `deleted`, and the final `done` or `stopped` with totals.
-- **`... is not a valid manifest`** The ledger file is damaged. Move it aside to re-hash every file, or run `project index build --force`. bc-rag never treats a damaged ledger as a first run, because that would drop the collection.
+- **`... is not a valid manifest`** The ledger file is damaged. Move it aside to re-hash every file, or run `bc-rag index --force`. bc-rag never treats a damaged ledger as a first run, because that would drop the collection.
 
 ---
 
@@ -681,13 +701,13 @@ Module map of `src/bc_rag/`:
 
 | Module | Holds |
 |---|---|
-| `cli/` | The command tree: `_app.py` (root, help, project lookup), one module per group. |
-| `catalog.py` | The registry, project lookup, and per-project intervals. |
+| `cli/` | The command tree: `_app.py` (root, help, project lookup), `index.py` (the top-level verbs), one module per group. |
+| `catalog.py` | The registry, project lookup, and your per-project `every`. |
 | `config.py` | `.bc-rag.json` models, loading, and validation. |
 | `facets.py` | The facet format, validation, and the OpenAPI facets. |
 | `discover.py` | Group globs and which group claims a file. |
 | `chunking.py` | The chunkers. |
-| `corpus.py` | Corpus documents and sidecars. |
+| `cache.py`, `corpus.py` | The cache folder, and the corpus documents and sidecars in it. |
 | `indexer.py` | The index pipeline, the manifest checks, and the project lock. |
 | `embeddings.py`, `voyage_api.py`, `jina_api.py`, `models.py` | Embedding and rerank clients, and the FastEmbed cache. |
 | `store.py` | Qdrant collections, payloads, facet indexes and filters. |
@@ -696,5 +716,5 @@ Module map of `src/bc_rag/`:
 | `services/` | The supervisor, Docker Qdrant, the indexer and mcp services, and service logs. |
 | `schedule.py` | Intervals and the per-project run state. |
 | `openapi.py`, `split_md.py` | OpenAPI rendering. |
-| `overview.py`, `reset.py` | `project index show`, `facets`, and `delete`. |
-| `usersettings.py`, `fileio.py`, `locks.py`, `duration.py` | Settings, atomic writes, file locks, durations. |
+| `overview.py`, `reset.py` | `status`, `facets`, and `project clear`. |
+| `usersettings.py`, `fileio.py`, `locks.py`, `duration.py` | Config keys, atomic writes, file locks, durations. |

@@ -34,6 +34,43 @@ def test_list_without_a_supervisor() -> None:
     assert "no project has a schedule" in result.output
 
 
+def test_list_shows_a_starting_supervisor_as_starting(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bc_rag.services.state import RUNNING, STOPPED, set_desired
+
+    monkeypatch.setattr(sup, "supervisor_running", lambda: True)
+    monkeypatch.setattr(sup, "lock_pid", lambda: 4242)
+    # supervisor.json is still the previous supervisor's.
+    write_runtime({"pid": 1111, "fingerprint": "old", "children": {"mcp": {"state": "running"}}})
+    set_desired(["mcp"], RUNNING, by="test")
+    set_desired(["indexer"], STOPPED, by="test")
+
+    result = runner.invoke(app, ["services", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "supervisor pid 4242  starting" in result.output
+    assert "code old" not in result.output
+    lines = {line.split("│")[1].strip(): line for line in result.output.splitlines() if "│" in line}
+    assert "starting" in lines["mcp"]
+    assert "stopped (stopped by you)" in lines["indexer"]
+
+
+def test_list_shows_the_code_once_the_supervisor_has_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bc_rag.services.state import source_fingerprint
+
+    monkeypatch.setattr(sup, "supervisor_running", lambda: True)
+    monkeypatch.setattr(sup, "lock_pid", lambda: 4242)
+    write_runtime({"pid": 4242, "fingerprint": source_fingerprint(), "children": {}})
+
+    result = runner.invoke(app, ["services", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "supervisor pid 4242" in result.output
+    assert "code current" in result.output
+    assert "starting" not in result.output
+
+
 def test_unknown_name_exits_2() -> None:
     result = runner.invoke(app, ["services", "stop", "redis"])
     assert result.exit_code == 2

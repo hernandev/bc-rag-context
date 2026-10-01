@@ -433,6 +433,21 @@ def stop_supervisor(
     return True
 
 
+def starting_pid() -> int | None:
+    """The pid of a supervisor that holds the lock but has not written supervisor.json yet.
+
+    Same rule as is_stale: the lock note gets the pid first, supervisor.json on the
+    first pass. Until they match, supervisor.json is empty or left by an earlier one.
+    None when no supervisor runs, or when it has finished starting.
+    """
+    if not supervisor_running():
+        return None
+    holder = lock_pid()
+    if holder is None or read_runtime().get("pid") == holder:
+        return None
+    return holder
+
+
 def is_stale() -> bool:
     """True when the running supervisor runs other code, or is the old daemon.
 
