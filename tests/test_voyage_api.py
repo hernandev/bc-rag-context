@@ -8,7 +8,30 @@ from bc_rag.voyage_api import (
     embed_contextual_chunks,
     embed_contextual_query,
     embed_texts,
+    rerank_texts,
 )
+
+
+def test_rerank_reads_the_data_list(monkeypatch) -> None:
+    monkeypatch.setenv("VOYAGE_AI_API_KEY", "voyage_test")
+
+    def fake_post(url, payload, *, api_key, model, tokens):
+        assert url.endswith("/v1/rerank")
+        # the response example of the HTTP reference: the list is "data", not "results".
+        return {
+            "object": "list",
+            "data": [
+                {"relevance_score": 0.9, "index": 1},
+                {"relevance_score": 0.1, "index": 0},
+            ],
+            "model": "rerank-2.5",
+            "usage": {"total_tokens": 8},
+        }
+
+    with patch("bc_rag.voyage_api._post_json", fake_post):
+        scores, tokens = rerank_texts(model="rerank-2.5", query="q", documents=["a", "b"])
+    assert scores == [0.1, 0.9]
+    assert tokens == 8
 
 
 def test_flat_embed_posts_input_type(monkeypatch) -> None:

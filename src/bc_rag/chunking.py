@@ -13,6 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from bc_rag.defaults import CODE_LANGUAGES, JSON_LANGUAGE, MARKDOWN_LANGUAGES
+from bc_rag.facets import facets_line
 
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*)$")
 FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
@@ -121,13 +122,13 @@ class Chunk:
     start_byte: int
     end_byte: int
     text: str
-    tags: list[str] = field(default_factory=list)
-    metadata: dict[str, str] = field(default_factory=dict)
+    # key -> values. The group's facets, then the keys bc-rag sets (group, apiPath, ...).
+    facets: dict[str, list[str]] = field(default_factory=dict)
     group: str | None = None
     priority: int = 0
 
     def embed_text(self) -> str:
-        """Dense embedding input. Path and symbol ride along as context."""
+        """Dense embedding input. Path, symbol and facets ride along as context."""
         header = [f"File: {self.path}"]
         if self.symbol:
             header.append(f"Symbol: {self.symbol}")
@@ -135,8 +136,8 @@ class Chunk:
             header.append(f"Kind: {self.kind}")
         if self.heading_path:
             header.append(f"Section: {self.heading_path}")
-        if self.tags:
-            header.append("Tags: " + ", ".join(self.tags))
+        if self.facets:
+            header.append("Facets: " + facets_line(self.facets))
         return "\n".join(header) + "\n\n" + self.text
 
     def sparse_text(self) -> str:
@@ -547,16 +548,12 @@ def _chunk_markdown(rel_path: str, language: str, text: str, max_chars: int) -> 
             part_end_line = part_start_line + max(part.count("\n"), 0)
             start_byte = byte_cursor + len(body[:local].encode("utf-8"))
             end_byte = start_byte + len(part.encode("utf-8"))
-            metadata: dict[str, str] = {}
-            tags: list[str] = []
+            facets: dict[str, list[str]] = {}
             if at:
-                metadata["at"] = at
-                metadata["day"] = at[:10]
-                tags.append(f"at:{at}")
-                tags.append(f"day:{at[:10]}")
+                facets["at"] = [at]
+                facets["day"] = [at[:10]]
             if role:
-                metadata["role"] = role
-                tags.append(f"role:{role}")
+                facets["role"] = [role]
             chunks.append(
                 Chunk(
                     path=rel_path,
@@ -569,8 +566,7 @@ def _chunk_markdown(rel_path: str, language: str, text: str, max_chars: int) -> 
                     start_byte=start_byte,
                     end_byte=end_byte,
                     text=text_out,
-                    tags=tags,
-                    metadata=metadata,
+                    facets=facets,
                 )
             )
             local += len(part)

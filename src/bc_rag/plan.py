@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from bc_rag.chunking import Chunk
-from bc_rag.config import RagConfig, load_config
+from bc_rag.config import RagConfig
 from bc_rag.defaults import CODE_LANGUAGES, JSON_LANGUAGE, MARKDOWN_LANGUAGES, OPENAPI_LANGUAGE
 from bc_rag.discover import SourceFile, iter_source_groups, source_for_path
 from bc_rag.indexer import chunks_for
@@ -27,12 +27,12 @@ def iter_index_files(
 
 
 def listed_group(source: SourceFile) -> str:
-    """Group name printed by `bc-rag files`."""
-    return source.config_group or source.group or ""
+    """Group name printed by `bc-rag sources files`."""
+    return source.group or ""
 
 
 def listed_space(config: RagConfig, source: SourceFile) -> str:
-    """Space name printed by `bc-rag files`."""
+    """Space name printed by `bc-rag sources files`."""
     return source.space or config.default_space
 
 
@@ -117,16 +117,8 @@ def chunks_for_user_path(root: Path, config: RagConfig, raw: str) -> tuple[Sourc
         raise ValueError(f"config does not include {rel}")
     chosen = materialized[0]
     text = chosen.path.read_text(encoding="utf-8", errors="replace")
-    return chosen, chunks_for(root, chosen, text, config)
+    return chosen, chunks_for(chosen, text, config)
 
 
 def _dense_model(config: RagConfig, source: SourceFile) -> str:
     return config.space_named(listed_space(config, source)).dense_id()
-
-
-def load_project(root: Path | None) -> tuple[Path, RagConfig]:
-    from bc_rag.runtime import resolve_root
-
-    project = resolve_root(root)
-    config, _path = load_config(project)
-    return project, config

@@ -33,7 +33,7 @@
 **Operation ID**: `{{ operation.operationId }}`
 {% endif %}
 {% if operation.tags -%}
-**Tags**: {{ operation.tags[0] }}
+**Tags**: {{ operation.tags | join(", ") }}
 {% endif %}
 
 {{ operation.summary }}
@@ -97,7 +97,7 @@
 **Operation ID**: `{{ operation.operationId }}`
 {% endif %}
 {% if operation.tags -%}
-**Tags**: {{ operation.tags[0] }}
+**Tags**: {{ operation.tags | join(", ") }}
 {% endif %}
 
 {{ operation.summary }}

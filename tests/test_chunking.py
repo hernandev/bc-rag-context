@@ -31,7 +31,10 @@ export class LocationProjectorService {
 
     texts = "\n".join(chunk.text for chunk in chunks)
     assert "function firstPresent" in texts
-    assert any(chunk.symbol == "firstPresent" or chunk.symbol == "LocationProjectorService" for chunk in chunks)
+    assert any(
+        chunk.symbol == "firstPresent" or chunk.symbol == "LocationProjectorService"
+        for chunk in chunks
+    )
 
 
 def test_comment_above_a_declaration_stays_with_that_chunk() -> None:
@@ -175,16 +178,16 @@ Second message.
         max_chars=8000,
         min_chars=1,
     )
-    texts = [chunk.text for chunk in chunks]
-    user = next(chunk for chunk in chunks if chunk.metadata.get("role") == "user")
+    user = next(chunk for chunk in chunks if chunk.facets.get("role") == ["user"])
     assert "still inside the message" in user.text
     assert "Second message." not in user.text
-    agent = next(chunk for chunk in chunks if chunk.metadata.get("role") == "agent")
+    agent = next(chunk for chunk in chunks if chunk.facets.get("role") == ["agent"])
     assert agent.heading_path is not None
     assert agent.heading_path.startswith("Chat > ")
     assert "Not a new chunk" in agent.text
-    assert agent.metadata["role"] == "agent"
-    assert agent.metadata["day"] == "2026-07-25"
+    assert agent.facets["role"] == ["agent"]
+    assert agent.facets["day"] == ["2026-07-25"]
+    assert agent.facets["at"][0].startswith("2026-07-25T")
 
 
 def test_long_turn_repeats_summary_on_the_next_piece() -> None:
@@ -219,10 +222,13 @@ please look
         max_chars=800,
         min_chars=1,
     )
-    agent_parts = [chunk for chunk in chunks if chunk.metadata.get("role") == "agent"]
+    agent_parts = [chunk for chunk in chunks if chunk.facets.get("role") == ["agent"]]
     assert len(agent_parts) > 1
     assert all("long answer" in chunk.text for chunk in agent_parts)
-    assert all(chunk.heading_path and chunk.heading_path.startswith("Chat > ") for chunk in agent_parts)
+    assert all(
+        chunk.heading_path and chunk.heading_path.startswith("Chat > ")
+        for chunk in agent_parts
+    )
     assert "short question" in agent_parts[0].text
     assert "User: short question" in agent_parts[1].text
 

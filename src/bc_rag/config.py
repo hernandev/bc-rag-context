@@ -1,4 +1,4 @@
-"""Load `.bc-rag.json` or fall back to defaults."""
+"""Load `.bc-rag.json`, the project file shared with the team. It is required."""
 
 from __future__ import annotations
 
@@ -6,22 +6,25 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from bc_rag.defaults import (
     CONFIG_FILENAME,
     DEFAULT_CHUNK_MAX_CHARS,
-    QDRANT_HTTP_URL,
     DEFAULT_CHUNK_MIN_CHARS,
-    DEFAULT_DENSE_MODEL,
-    DEFAULT_INCLUDE,
     DEFAULT_LIMIT,
-    DEFAULT_OPENAPI_INCLUDE,
     DEFAULT_PREFETCH,
-    DEFAULT_RERANK_MODEL,
     DEFAULT_SPARSE_MODEL,
     HARD_EXCLUDE_DIR_NAMES,
 )
+from bc_rag.facets import FACET_KEY, RESERVED_KEYS, check_not_reserved, normalize_facets
 
 
 class ModelSpec(BaseModel):
@@ -34,31 +37,6 @@ class ModelSpec(BaseModel):
 
     def model_id(self) -> str:
         return self.model
-
-
-class SpaceConfig(BaseModel):
-    """One vector space. The dense model owns the collection."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    dense: ModelSpec
-    sparse: ModelSpec
-    rerank: ModelSpec | None = None
-    dimensions: int | None = Field(default=None, ge=1)
-    chunk: "ChunkConfig | None" = None
-    retrieve: "RetrieveConfig" = Field(default_factory=lambda: RetrieveConfig())
-
-    def dense_id(self) -> str:
-        return self.dense.model
-
-    def dense_provider(self) -> str:
-        return self.dense.provider
-
-
-class EmbedConfig(BaseModel):
-    """Kept so older call sites fail at import time if they still build an embed block."""
-
-    model_config = ConfigDict(extra="forbid")
 
 
 class RetrieveConfig(BaseModel):
@@ -76,50 +54,65 @@ class ChunkConfig(BaseModel):
     min_chars: int = Field(default=DEFAULT_CHUNK_MIN_CHARS, ge=0, le=2000)
 
 
-SpaceConfig.model_rebuild()
-
-
-class ChunkOverride(BaseModel):
-    """Partial chunk settings. Omitted keys inherit from the top-level chunk block."""
+class SpaceConfig(BaseModel):
+    """One vector space. The dense model owns the collection."""
 
     model_config = ConfigDict(extra="forbid")
 
-    max_chars: int | None = Field(default=None, ge=200, le=80_000)
-    min_chars: int | None = Field(default=None, ge=0, le=2000)
+    dense: ModelSpec
+    sparse: ModelSpec
+    rerank: ModelSpec | None = None
+    dimensions: int | None = Field(default=None, ge=1)
+    chunk: ChunkConfig | None = None
+    retrieve: RetrieveConfig = Field(default_factory=RetrieveConfig)
 
+    def dense_id(self) -> str:
+        return self.dense.model
 
-class EmbedOverride(BaseModel):
-    """Partial embed settings. A different dense model is rejected at index time."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    dense: str | None = None
-    sparse: str | None = None
-    rerank: str | None = None
-
-
-class OpenApiConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    include: list[str] = Field(default_factory=lambda: list(DEFAULT_OPENAPI_INCLUDE))
+    def dense_provider(self) -> str:
+        return self.dense.provider
 
 
 class SourceGroup(BaseModel):
-    """One named include/exclude set. `name` is stored as a tag on every chunk."""
+    """One named include/exclude set. Every file it claims carries its facets and its name."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    tags: list[str] = Field(default_factory=list)
-    metadata: dict[str, str] = Field(default_factory=dict)
+    # key -> value or list of values. Stored as key -> list.
+    facets: dict[str, list[str]] = Field(default_factory=dict)
     include: list[str] = Field(default_factory=list)
     exclude: list[str] = Field(default_factory=list)
     priority: int = 0
-    follow_gitignore: bool | None = None
     kind: Literal["auto", "openapi"] = "auto"
     enabled: bool = True
     space: str
+
+    @field_validator("facets", mode="before")
+    @classmethod
+    def _check_facets(cls, value: Any, info: Any) -> dict[str, list[str]]:
+        name = (info.data or {}).get("name", "?")
+        facets = normalize_facets(value, where=f"group {name!r} facets")
+        check_not_reserved(facets, where=f"group {name!r} facets")
+        return facets
+
+
+class ScheduleConfig(BaseModel):
+    """`schedule` in `.bc-rag.json`. `every` is a duration such as 15m."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    every: str | None = None
+
+    @field_validator("every")
+    @classmethod
+    def _check_every(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from bc_rag.duration import parse_duration
+
+        parse_duration(value)
+        return value.strip()
 
 
 class RagConfig(BaseModel):
@@ -131,10 +124,19 @@ class RagConfig(BaseModel):
     groups: list[SourceGroup] = Field(default_factory=list)
     # A program whose stdout is {"groups": [...]}. Those groups are appended to `groups`.
     groups_command: str | list[str] | None = None
-    follow_gitignore: bool = False
     spaces: dict[str, SpaceConfig]
     default_space: str
-    qdrant_url: str | None = None
+    # The team's background indexing interval. None = no background indexing.
+    schedule: ScheduleConfig | None = None
+    # One line per project facet key, telling a search client what the key means.
+    facet_keys: dict[str, str] = Field(default_factory=dict)
+    # Filter examples for this project, shown verbatim by the MCP list_projects tool.
+    search_hints: list[str] = Field(default_factory=list)
+    # True when groupsCommand was skipped (load_config groups=False).
+    _partial: bool = PrivateAttr(default=False)
+
+    def is_partial(self) -> bool:
+        return self._partial
 
     @model_validator(mode="after")
     def _check_spaces(self) -> RagConfig:
@@ -151,11 +153,20 @@ class RagConfig(BaseModel):
                 _check_model(f"space {name!r} rerank", spec.rerank)
             if spec.chunk is None:
                 raise ValueError(f"space {name!r} requires chunk")
+        names: set[str] = set()
         for group in self.groups:
+            if group.name in names:
+                raise ValueError(f"group name {group.name!r} is repeated")
+            names.add(group.name)
             if group.space not in self.spaces:
                 raise ValueError(
                     f"group {group.name!r} space {group.space!r} is not in spaces"
                 )
+        for key in self.facet_keys:
+            if not FACET_KEY.fullmatch(key):
+                raise ValueError(f"facetKeys: {key!r} is not a valid facet key")
+            if key in RESERVED_KEYS:
+                raise ValueError(f"facetKeys: {key!r} is set and described by bc-rag")
         return self
 
     def space_named(self, space: str) -> SpaceConfig:
@@ -197,21 +208,13 @@ class RagConfig(BaseModel):
         )
 
     def store_dir(self, root: Path, space: str | None = None) -> Path:
-        base = self.project_dir(root)
-        dest = base / self.backend_id(space)
-        if (space or self.default_space) == self.default_space:
-            _adopt_legacy_local_store(base, dest, self)
-        return dest
-
-    def qdrant_path(self, root: Path) -> Path:
-        return self.store_dir(root) / "qdrant"
+        return self.project_dir(root) / self.backend_id(space)
 
     def qdrant_http_url(self) -> str:
-        import os
+        """The user's `qdrant-url` setting. Qdrant is per user, not per project."""
+        from bc_rag.usersettings import qdrant_url
 
-        return (os.environ.get("BC_RAG_QDRANT_URL") or self.qdrant_url or QDRANT_HTTP_URL).rstrip(
-            "/"
-        )
+        return qdrant_url()
 
     def qdrant_collection(self, root: Path, space: str | None = None) -> str:
         import hashlib
@@ -259,38 +262,16 @@ def _backend_slug(name: str) -> str:
     return name.replace("/", "-").replace(" ", "-")
 
 
-def _adopt_legacy_local_store(base: Path, dest: Path, configuration: RagConfig) -> None:
-    """Move unlabeled `qdrant/` into the keyed local folder when that folder is empty."""
-    if configuration.spaces[configuration.default_space].dense_provider() == "jina":
-        return
-    legacy = base / "qdrant"
-    if not legacy.is_dir():
-        return
-    dest_qdrant = dest / "qdrant"
-    if dest_qdrant.exists() or (dest / "manifest.json").is_file():
-        return
-    dest.mkdir(parents=True, exist_ok=True)
-    import shutil
-
-    shutil.move(str(legacy), str(dest_qdrant))
-    for name in ("manifest.json", "index.jsonl"):
-        src = base / name
-        if src.exists() and not (dest / name).exists():
-            shutil.move(str(src), str(dest / name))
-
-
-def with_jina_api(configuration: RagConfig, enabled: bool) -> RagConfig:
-    """Unused. The dense model lives on each space."""
-    del configuration, enabled
-    raise ValueError("with_jina_api is not a config key. Set provider and model on a space.")
-
-
 def config_path(root: Path) -> Path:
     return root / CONFIG_FILENAME
 
 
-def load_config(root: Path) -> tuple[RagConfig, Path | None]:
-    """Return (config, path_or_none_if_defaults)."""
+def load_config(root: Path, *, groups: bool = True) -> tuple[RagConfig, Path]:
+    """Return (config, path). `.bc-rag.json` is required.
+
+    `groups=False` skips `groupsCommand`, for paths that only need spaces and models
+    (search, show, delete). Such a config is partial: it can never list or index files.
+    """
     path = config_path(root)
     if not path.is_file():
         raise ValueError(f"{path} is required. spaces and defaultSpace are required.")
@@ -301,7 +282,10 @@ def load_config(root: Path) -> tuple[RagConfig, Path | None]:
         raise ValueError(f"{path} must contain a JSON object")
     configuration = RagConfig.model_validate(_normalize(raw))
     if configuration.groups_command:
-        configuration = _append_command_groups(root, configuration)
+        if groups:
+            configuration = _append_command_groups(root, configuration)
+        else:
+            configuration._partial = True
     return configuration, path
 
 
@@ -310,22 +294,20 @@ def public_config(configuration: RagConfig) -> dict[str, Any]:
     data = configuration.model_dump(mode="json")
     data["groupsCommand"] = data.pop("groups_command")
     data["defaultSpace"] = data.pop("default_space")
-    if data.get("follow_gitignore") is False:
-        data.pop("follow_gitignore", None)
-    elif "follow_gitignore" in data:
-        data["followGitignore"] = data.pop("follow_gitignore")
-    if data.get("qdrant_url") is None:
-        data.pop("qdrant_url", None)
-    if data.get("groupsCommand") is None:
-        data.pop("groupsCommand", None)
+    data["facetKeys"] = data.pop("facet_keys")
+    data["searchHints"] = data.pop("search_hints")
+    for key in ("schedule", "groupsCommand", "facetKeys", "searchHints"):
+        if data.get(key) in (None, {}, []):
+            data.pop(key, None)
     groups = [_public_group(group) for group in data.pop("groups", [])]
     first = (
         "exclude",
         "groupsCommand",
-        "followGitignore",
         "defaultSpace",
+        "schedule",
+        "facetKeys",
+        "searchHints",
         "spaces",
-        "qdrant_url",
     )
     ordered = {key: data[key] for key in first if key in data}
     for key, value in data.items():
@@ -345,7 +327,7 @@ def _public_group(group: dict[str, Any]) -> dict[str, Any]:
 
 
 def dump_default_config() -> str:
-    """File written by `bc-rag init`. One space, dense model on that space."""
+    """File written by `bc-rag project add`. One space, dense model on that space."""
     configuration = RagConfig(
         default_space="default",
         exclude=[f"**/{name}/**" for name in sorted(HARD_EXCLUDE_DIR_NAMES)],
@@ -377,7 +359,11 @@ def format_config(data: dict[str, Any]) -> str:
             rendered = _format_spaces(value, 2)
         elif key == "groups" and isinstance(value, list):
             rendered = _format_groups(value, 2)
-        elif isinstance(value, list) and value and all(not isinstance(item, (dict, list)) for item in value):
+        elif (
+            isinstance(value, list)
+            and value
+            and all(not isinstance(item, (dict, list)) for item in value)
+        ):
             rendered = _format_string_list(value, 2)
         else:
             rendered = _compact(value)
@@ -393,7 +379,8 @@ def _format_spaces(spaces: dict[str, Any], indent: int) -> str:
     names = list(spaces)
     for index, name in enumerate(names):
         comma = "," if index < len(names) - 1 else ""
-        blocks.append(f"{inner}{json.dumps(name)}: {_format_space(spaces[name], indent + 2)}{comma}")
+        rendered = _format_space(spaces[name], indent + 2)
+        blocks.append(f"{inner}{json.dumps(name)}: {rendered}{comma}")
     return "{\n" + "\n".join(blocks) + f"\n{pad}}}"
 
 
@@ -471,19 +458,29 @@ def _append_command_groups(root: Path, configuration: RagConfig) -> RagConfig:
     return RagConfig.model_validate(merged.model_dump())
 
 
+_QDRANT_URL_MOVED = (
+    "qdrant_url is not a project key. Run `bc-rag config set qdrant-url URL --global`."
+)
+
+
 def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
     """Accept camelCase aliases so a later UI can write either shape."""
     aliases = {
-        "followGitignore": "follow_gitignore",
         "groupsCommand": "groups_command",
         "defaultSpace": "default_space",
+        "facetKeys": "facet_keys",
+        "searchHints": "search_hints",
     }
     banned = {
-        "embed": "embed is not a config key. spaces, defaultSpace, sparse, and rerank are top level.",
+        "embed": (
+            "embed is not a config key. "
+            "spaces, defaultSpace, sparse, and rerank are top level."
+        ),
         "chunk": "chunk is not a top-level key. Set chunk on each space.",
         "openapi": "openapi is not a config key. Use a group with kind openapi.",
         "include": "include is not a top-level key. Set include on each group.",
-        "tags": "tags is not a top-level key. Set tags on each group.",
+        "tags": "tags is not a config key. Set facets on each group.",
+        "facets": "facets is not a top-level key. Set facets on each group.",
         "dense": "dense is not a top-level key. Set dense on each space.",
         "sparse": "sparse is not a top-level key. Set sparse on each space.",
         "rerank": "rerank is not a top-level key. Set rerank on each space.",
@@ -492,6 +489,8 @@ def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
         "jinaApi": "jinaApi is not a config key. Set provider and model on each space.",
         "jinaDense": "jinaDense is not a config key. Set provider and model on each space.",
         "jinaRerank": "jinaRerank is not a config key. Set provider and model on rerank.",
+        "qdrant_url": _QDRANT_URL_MOVED,
+        "qdrantUrl": _QDRANT_URL_MOVED,
     }
     out: dict[str, Any] = {}
     for key, value in raw.items():
@@ -513,15 +512,4 @@ def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
                     chunk["max_chars"] = chunk.pop("maxChars")
                 if "minChars" in chunk and "min_chars" not in chunk:
                     chunk["min_chars"] = chunk.pop("minChars")
-    groups = out.get("groups")
-    if isinstance(groups, list):
-        normalized_groups = []
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            item = dict(group)
-            if "followGitignore" in item and "follow_gitignore" not in item:
-                item["follow_gitignore"] = item.pop("followGitignore")
-            normalized_groups.append(item)
-        out["groups"] = normalized_groups
     return out

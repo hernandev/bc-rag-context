@@ -1,4 +1,10 @@
-"""Qdrant store. Search is the dense vector only. BM25 is stored and not queried."""
+"""Qdrant store: one collection per space, with a dense vector and a BM25 vector per chunk.
+
+`query` searches the dense vector; `query_sparse` searches BM25. Each point carries
+its facets as a nested `facets` object, and every facet key gets a keyword index
+(`facets.<key>`) the first time a point with that key is written, so the key can
+be filtered and listed from that pass on.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,18 @@ from uuid import NAMESPACE_URL, uuid5
 from bc_rag.chunking import Chunk
 from bc_rag.defaults import COLLECTION_NAME
 from bc_rag.embeddings import SparseVec
-from bc_rag.facets import SIDECAR_KEYS, is_filter_key, parse_tag_clause
+from bc_rag.facets import Facets
+
+FACETS_FIELD = "facets"
+# bc-rag's own ceiling on the values one facet listing returns.
+FACET_VALUES_LIMIT = 10_000
+
+
+def qdrant_api_key() -> str | None:
+    """The `qdrant-api-key` setting, sent as the api-key header. None for a local Qdrant."""
+    from bc_rag.usersettings import get_setting
+
+    return get_setting("qdrant-api-key")
 
 
 @dataclass(slots=True)
@@ -26,6 +43,10 @@ class Hit:
     text: str
     payload: dict[str, Any]
     project: str | None = None
+
+    @property
+    def facets(self) -> Facets:
+        return dict(self.payload.get(FACETS_FIELD) or {})
 
 
 class HybridStore:
@@ -43,8 +64,12 @@ class HybridStore:
         self.url = url
         self.read_only = read_only
         self.collection = collection or COLLECTION_NAME
+        # payload fields known to have a keyword index in this collection.
+        self._indexed: set[str] = set()
         if url:
-            self.client = QdrantClient(url=url, timeout=60, check_compatibility=False)
+            self.client = QdrantClient(
+                url=url, api_key=qdrant_api_key(), timeout=60, check_compatibility=False
+            )
             return
         if path is None:
             raise ValueError("HybridStore needs path= for tests or url= for Docker Qdrant")
@@ -74,6 +99,7 @@ class HybridStore:
             existing = _dense_size(info)
             if existing is not None and existing != dense_dim:
                 self.client.delete_collection(self.collection)
+                self._indexed.clear()
             else:
                 self._ensure_compact_storage(info)
                 self.ensure_payload_indexes()
@@ -92,11 +118,7 @@ class HybridStore:
         self.ensure_payload_indexes()
 
     def _ensure_compact_storage(self, info: Any) -> None:
-        """Move full dense vectors to disk and keep int8 copies in RAM.
-
-        Collections created before this setting get migrated in place. Qdrant
-        rebuilds the segments in the background; no reindex is needed.
-        """
+        """Keep full dense vectors on disk and int8 copies in RAM."""
         if self.read_only:
             return
         from qdrant_client.models import VectorParamsDiff
@@ -117,6 +139,7 @@ class HybridStore:
     def recreate_collection(self, dense_dim: int) -> None:
         if self.client.collection_exists(self.collection):
             self.client.delete_collection(self.collection)
+        self._indexed.clear()
         self.ensure_collection(dense_dim)
 
     def count(self) -> int:
@@ -137,6 +160,37 @@ class HybridStore:
             ),
         )
 
+    # -- indexes -----------------------------------------------------------------
+
+    def _payload_schema(self) -> dict[str, Any]:
+        info = self.client.get_collection(self.collection)
+        return dict(getattr(info, "payload_schema", None) or {})
+
+    def _create_index(self, field: str) -> None:
+        from qdrant_client.models import PayloadSchemaType
+
+        self.client.create_payload_index(
+            collection_name=self.collection,
+            field_name=field,
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+        self._indexed.add(field)
+
+    def ensure_payload_indexes(self) -> None:
+        """The base index on `path`. Read-only sessions never write indexes."""
+        if self.read_only or not self.client.collection_exists(self.collection):
+            return
+        if not self._indexed:
+            self._indexed.update(self._payload_schema())
+        if "path" not in self._indexed:
+            self._create_index("path")
+
+    def _ensure_facet_indexes(self, keys: set[str]) -> None:
+        for key in sorted(keys):
+            field = f"{FACETS_FIELD}.{key}"
+            if field not in self._indexed:
+                self._create_index(field)
+
     def upsert_chunks(
         self,
         chunks: list[Chunk],
@@ -147,6 +201,8 @@ class HybridStore:
 
         if not chunks:
             return
+        # a new key is indexed before its first point lands, so it is listable at once.
+        self._ensure_facet_indexes({key for chunk in chunks for key in chunk.facets})
         points = []
         for chunk, dense_vec, sparse_vec in zip(chunks, dense, sparse, strict=True):
             points.append(
@@ -164,183 +220,112 @@ class HybridStore:
             )
         self.client.upsert(collection_name=self.collection, points=points)
 
-    def ensure_payload_indexes(self) -> None:
-        from qdrant_client.models import PayloadSchemaType
-
-        if not self.client.collection_exists(self.collection):
-            return
-        for key in ("group", "tags", "path", *SIDECAR_KEYS):
-            try:
-                self.client.create_payload_index(
-                    collection_name=self.collection,
-                    field_name=key,
-                    field_schema=PayloadSchemaType.KEYWORD,
-                )
-            except Exception:
-                pass
+    # -- search ------------------------------------------------------------------
 
     def query(
         self,
         *,
         dense: list[float],
-        sparse: SparseVec | None = None,
-        prefetch: int,
         limit: int,
-        groups: list[str] | None = None,
-        tags: list[str] | None = None,
+        facets: Facets | None = None,
+        exclude: Facets | None = None,
     ) -> list[Hit]:
-        del sparse, prefetch
-        self.ensure_payload_indexes()
-        query_filter = _payload_filter(groups=groups, tags=tags)
         response = self.client.query_points(
             collection_name=self.collection,
             query=dense,
             using="dense",
-            query_filter=query_filter,
+            query_filter=facet_filter(facets, exclude),
             limit=limit,
             with_payload=True,
         )
-        hits: list[Hit] = []
-        for point in response.points:
-            payload = point.payload or {}
-            hits.append(
-                Hit(
-                    score=float(point.score),
-                    path=str(payload.get("path", "")),
-                    language=str(payload.get("language", "")),
-                    kind=str(payload.get("kind", "")),
-                    symbol=payload.get("symbol"),
-                    heading_path=payload.get("heading_path"),
-                    start_line=int(payload.get("start_line") or 0),
-                    end_line=int(payload.get("end_line") or 0),
-                    text=str(payload.get("text", "")),
-                    payload=payload,
-                )
-            )
-        return hits
+        return [_hit(point) for point in response.points]
 
     def query_sparse(
         self,
         *,
         sparse: SparseVec,
         limit: int,
-        groups: list[str] | None = None,
-        tags: list[str] | None = None,
+        facets: Facets | None = None,
+        exclude: Facets | None = None,
     ) -> list[Hit]:
         from qdrant_client.models import SparseVector
 
-        self.ensure_payload_indexes()
-        query_filter = _payload_filter(groups=groups, tags=tags)
         response = self.client.query_points(
             collection_name=self.collection,
             query=SparseVector(indices=sparse.indices, values=sparse.values),
             using="bm25",
-            query_filter=query_filter,
+            query_filter=facet_filter(facets, exclude),
             limit=limit,
             with_payload=True,
         )
-        hits: list[Hit] = []
-        for point in response.points:
-            payload = point.payload or {}
-            hits.append(
-                Hit(
-                    score=float(point.score),
-                    path=str(payload.get("path", "")),
-                    language=str(payload.get("language", "")),
-                    kind=str(payload.get("kind", "")),
-                    symbol=payload.get("symbol"),
-                    heading_path=payload.get("heading_path"),
-                    start_line=int(payload.get("start_line") or 0),
-                    end_line=int(payload.get("end_line") or 0),
-                    text=str(payload.get("text", "")),
-                    payload=payload,
-                )
-            )
-        return hits
+        return [_hit(point) for point in response.points]
 
-    def facet_values(self, key: str, *, limit: int = 500) -> list[tuple[str, int]]:
-        """Unique payload values and how many points have each one."""
+    # -- listing -----------------------------------------------------------------
+
+    def facet_keys(self) -> dict[str, int]:
+        """Facet key -> how many points carry it, from the collection's indexes."""
+        if not self.client.collection_exists(self.collection):
+            return {}
+        prefix = f"{FACETS_FIELD}."
+        keys: dict[str, int] = {}
+        for field, schema in self._payload_schema().items():
+            if not field.startswith(prefix):
+                continue
+            points = int(getattr(schema, "points", 0) or 0)
+            if points > 0:
+                keys[field[len(prefix) :]] = points
+        return dict(sorted(keys.items()))
+
+    def facet_values(self, key: str, *, limit: int = FACET_VALUES_LIMIT) -> list[tuple[str, int]]:
+        """The distinct values of one facet key, with point counts, most points first."""
         if not self.client.collection_exists(self.collection):
             return []
-        self.ensure_payload_indexes()
         result = self.client.facet(
             collection_name=self.collection,
-            key=key,
+            key=f"{FACETS_FIELD}.{key}",
             limit=limit,
-            exact=False,
+            exact=True,
         )
         rows: list[tuple[str, int]] = []
         for hit in getattr(result, "hits", []) or []:
             value = getattr(hit, "value", None)
-            count = int(getattr(hit, "count", 0) or 0)
             if value is None:
                 continue
-            rows.append((str(value), count))
+            rows.append((str(value), int(getattr(hit, "count", 0) or 0)))
         return rows
 
 
-def _payload_filter(
-    *,
-    groups: list[str] | None,
-    tags: list | None,
-):
+def facet_filter(facets: Facets | None, exclude: Facets | None = None):
+    """Any value within one key, every key, and none of `exclude`. None when empty."""
     from qdrant_client.models import FieldCondition, Filter, MatchAny
 
-    from bc_rag.facets import tag_branches
+    def conditions(source: Facets | None) -> list[Any]:
+        return [
+            FieldCondition(key=f"{FACETS_FIELD}.{key}", match=MatchAny(any=list(values)))
+            for key, values in (source or {}).items()
+        ]
 
-    must = []
-    if groups:
-        must.append(FieldCondition(key="group", match=MatchAny(any=list(groups))))
-    branches = tag_branches(tags)
-    if not branches:
-        if not must:
-            return None
-        return Filter(must=must)
-    built = [_branch_filter(branch) for branch in branches]
-    if len(built) == 1:
-        only = built[0]
-        if must:
-            only.must = [*must, *(only.must or [])]
-        return only
-    must.append(Filter(should=built))
-    return Filter(must=must)
-
-
-def _branch_filter(terms: list[str]):
-    """One AND group. A leading "-" excludes that value."""
-    from qdrant_client.models import FieldCondition, Filter, MatchAny
-
-    include: dict[str, list[str]] = {}
-    exclude: dict[str, list[str]] = {}
-    raw_include: dict[str, list[str]] = {}
-    raw_exclude: dict[str, list[str]] = {}
-    for tag in terms:
-        if not tag:
-            continue
-        negated = tag.startswith("-") and len(tag) > 1
-        body = tag[1:] if negated else tag
-        clause = parse_tag_clause(body)
-        if clause is not None:
-            key, value = clause
-            bucket = (exclude if negated else include).setdefault(key, [])
-            if value not in bucket:
-                bucket.append(value)
-            continue
-        raw_key = body.split(":", 1)[0] if ":" in body else body
-        bucket = (raw_exclude if negated else raw_include).setdefault(raw_key, [])
-        if body not in bucket:
-            bucket.append(body)
-    must = []
-    must_not = []
-    for key, values in include.items():
-        must.append(FieldCondition(key=key, match=MatchAny(any=values)))
-    for key, values in exclude.items():
-        must_not.append(FieldCondition(key=key, match=MatchAny(any=values)))
-    for values in raw_include.values():
-        must.append(FieldCondition(key="tags", match=MatchAny(any=values)))
-    for values in raw_exclude.values():
-        must_not.append(FieldCondition(key="tags", match=MatchAny(any=values)))
+    must = conditions(facets)
+    must_not = conditions(exclude)
+    if not must and not must_not:
+        return None
     return Filter(must=must or None, must_not=must_not or None)
+
+
+def _hit(point: Any) -> Hit:
+    payload = point.payload or {}
+    return Hit(
+        score=float(point.score),
+        path=str(payload.get("path", "")),
+        language=str(payload.get("language", "")),
+        kind=str(payload.get("kind", "")),
+        symbol=payload.get("symbol"),
+        heading_path=payload.get("heading_path"),
+        start_line=int(payload.get("start_line") or 0),
+        end_line=int(payload.get("end_line") or 0),
+        text=str(payload.get("text", "")),
+        payload=payload,
+    )
 
 
 def _scalar_quantization():
@@ -361,7 +346,7 @@ def _point_id(chunk: Chunk) -> str:
 
 
 def _payload(chunk: Chunk) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+    return {
         "path": chunk.path,
         "language": chunk.language,
         "kind": chunk.kind,
@@ -370,20 +355,9 @@ def _payload(chunk: Chunk) -> dict[str, Any]:
         "start_line": chunk.start_line,
         "end_line": chunk.end_line,
         "text": chunk.text,
-        "tags": list(chunk.tags),
-        "group": chunk.group,
         "priority": chunk.priority,
+        FACETS_FIELD: {key: list(values) for key, values in chunk.facets.items()},
     }
-    for key, value in chunk.metadata.items():
-        if not value:
-            continue
-        # Older chunks stored the API route under `path`. That name is the file.
-        if key == "path":
-            key = "apiPath"
-        if key in payload or not is_filter_key(key):
-            continue
-        payload[key] = value
-    return payload
 
 
 def _dense_size(info: Any) -> int | None:

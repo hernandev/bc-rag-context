@@ -1,13 +1,20 @@
-"""Dense retrieve, then optional cross-encoder rerank."""
+"""Search one space: dense retrieve then rerank, or BM25 only.
+
+Rerank follows the space's config, the same rule everywhere: a space reranks when
+`retrieve.rerank` is true and it names a `rerank` model. Dense search then asks the
+store for a wider candidate pool (`max(prefetch, limit * 4)`) and keeps the best
+`limit` after rerank.
+"""
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 from bc_rag.catalog import ProjectEntry, find_project, living_projects
-from bc_rag.config import RagConfig, load_config
+from bc_rag.config import RagConfig, SpaceConfig, load_config
 from bc_rag.embeddings import Embedder, Reranker
+from bc_rag.facets import Facets
 from bc_rag.store import Hit, HybridStore
 
 
@@ -15,6 +22,7 @@ from bc_rag.store import Hit, HybridStore
 class QueryResult:
     query: str
     hits: list[Hit]
+    reranked: bool = False
 
 
 def search(
@@ -26,34 +34,28 @@ def search(
     reranker: Reranker | None,
     limit: int | None = None,
     use_rerank: bool | None = None,
-    groups: list[str] | None = None,
-    tags: list[str] | None = None,
+    facets: Facets | None = None,
+    exclude: Facets | None = None,
     space: str | None = None,
 ) -> QueryResult:
+    """Dense search. Reranks when `use_rerank` (None = the space's retrieve.rerank) and a
+    reranker is given."""
     retrieve = config.space_named(space or config.default_space).retrieve
     final_limit = limit if limit is not None else retrieve.limit
-    do_rerank = retrieve.rerank if use_rerank is None else use_rerank
+    do_rerank = (retrieve.rerank if use_rerank is None else use_rerank) and reranker is not None
     dense, _sparse = embedder.embed_query(query)
-    candidate_limit = max(retrieve.prefetch, final_limit)
-    if do_rerank and reranker is not None:
-        candidate_limit = max(candidate_limit, final_limit * 4)
-    hits = store.query(
-        dense=dense,
-        prefetch=candidate_limit,
-        limit=candidate_limit if (do_rerank and reranker is not None) else final_limit,
-        groups=groups,
-        tags=tags,
-    )
-    if do_rerank and reranker is not None and hits:
+    candidates = max(retrieve.prefetch, final_limit * 4) if do_rerank else final_limit
+    hits = store.query(dense=dense, limit=candidates, facets=facets, exclude=exclude)
+    if do_rerank and hits:
+        assert reranker is not None
         scores = reranker.rerank(query, [hit.text for hit in hits])
         ranked = sorted(zip(scores, hits, strict=True), key=lambda row: row[0], reverse=True)
         hits = []
         for score, hit in ranked[:final_limit]:
             hit.score = float(score)
             hits.append(hit)
-    else:
-        hits = hits[:final_limit]
-    return QueryResult(query=query, hits=hits)
+        return QueryResult(query=query, hits=hits, reranked=True)
+    return QueryResult(query=query, hits=hits[:final_limit])
 
 
 def search_sparse(
@@ -63,37 +65,30 @@ def search_sparse(
     embedder: Embedder,
     store: HybridStore,
     limit: int | None = None,
-    groups: list[str] | None = None,
-    tags: list[str] | None = None,
+    facets: Facets | None = None,
+    exclude: Facets | None = None,
     space: str | None = None,
 ) -> QueryResult:
     """BM25 only. No dense vector and no rerank."""
-    final_limit = limit if limit is not None else config.space_named(space or config.default_space).retrieve.limit
+    retrieve = config.space_named(space or config.default_space).retrieve
+    final_limit = limit if limit is not None else retrieve.limit
     sparse = embedder.embed_sparse_query(query)
-    hits = store.query_sparse(
-        sparse=sparse,
-        limit=final_limit,
-        groups=groups,
-        tags=tags,
-    )
+    hits = store.query_sparse(sparse=sparse, limit=final_limit, facets=facets, exclude=exclude)
     return QueryResult(query=query, hits=hits)
-
-
-_reranker_cache: dict[tuple[str, bool], Reranker] = {}
 
 
 def search_projects(
     query: str,
     *,
-    project: str | None = None,
-    space: str | None = None,
+    project: str,
+    space: str,
     limit: int | None = None,
-    use_rerank: bool = True,
-    groups: list[str] | None = None,
-    tags: list[str] | None = None,
+    use_rerank: bool | None = None,
+    facets: Facets | None = None,
+    exclude: Facets | None = None,
     sparse: bool = False,
 ) -> QueryResult:
-    """Search one project and one space. Both arguments are required."""
+    """Search one space of one registered project. `use_rerank` None follows the space."""
     if not project:
         raise ValueError("project is required")
     if not space:
@@ -101,41 +96,18 @@ def search_projects(
     entries = living_projects()
     found = find_project(project, entries)
     if found is None:
-        raise ValueError(f"unknown project: {project}")
-    entries = [found]
-    if not entries:
-        return QueryResult(query=query, hits=[])
-
-    pooled: list[Hit] = []
-    reranker: Reranker | None = None
-    final_limit = 8
-    for entry in entries:
-        hits, cfg, ranker = _search_entry(
-            entry,
-            query,
-            space=space,
-            limit=limit,
-            use_rerank=False,
-            groups=groups,
-            tags=tags,
-            sparse=sparse,
-        )
-        pooled.extend(hits)
-        if ranker is not None:
-            reranker = ranker
-        final_limit = limit if limit is not None else cfg.space_named(space).retrieve.limit
-
-    if not sparse and use_rerank and reranker is not None and pooled:
-        scores = reranker.rerank(query, [hit.text for hit in pooled])
-        ranked = sorted(zip(scores, pooled, strict=True), key=lambda row: row[0], reverse=True)
-        hits = []
-        for score, hit in ranked[:final_limit]:
-            hit.score = float(score)
-            hits.append(hit)
-        return QueryResult(query=query, hits=hits)
-
-    pooled.sort(key=lambda hit: hit.score, reverse=True)
-    return QueryResult(query=query, hits=pooled[:final_limit])
+        known = ", ".join(entry.name for entry in entries) or "none"
+        raise ValueError(f"unknown project: {project}. Registered projects: {known}")
+    return _search_entry(
+        found,
+        query,
+        space=space,
+        limit=limit,
+        use_rerank=use_rerank,
+        facets=facets,
+        exclude=exclude,
+        sparse=sparse,
+    )
 
 
 def _search_entry(
@@ -144,36 +116,34 @@ def _search_entry(
     *,
     space: str,
     limit: int | None,
-    use_rerank: bool,
-    groups: list[str] | None = None,
-    tags: list[str] | None = None,
+    use_rerank: bool | None,
+    facets: Facets | None = None,
+    exclude: Facets | None = None,
     sparse: bool = False,
-) -> tuple[list[Hit], RagConfig, Reranker | None]:
-    from bc_rag.runtime import make_embedder
-
-    root = Path(entry.root)
-    config, _ = load_config(root)
+) -> QueryResult:
+    root = entry.root_path()
+    config, _path = load_config(root, groups=False)
     spec = config.space_named(space)
-    collection_space = space
     store = HybridStore(
         url=config.qdrant_http_url(),
-        collection=config.qdrant_collection(root, collection_space),
+        collection=config.qdrant_collection(root, space),
         read_only=True,
     )
     try:
         try:
+            stored_keys = store.facet_keys()
             empty = store.count() == 0
-        except Exception:
-            return [], config, None
+        except Exception as error:
+            raise RuntimeError(f"qdrant unreachable at {store.url}: {error}") from error
+        for key in [*(facets or {}), *(exclude or {})]:
+            if key not in stored_keys and not empty:
+                known = ", ".join(stored_keys) or "none"
+                raise ValueError(
+                    f"facet key {key!r} is not stored in space {space!r}. Keys here: {known}"
+                )
         if empty:
-            return [], config, None
-        embedder = make_embedder(config, spec)
-        reranker = None
-        if use_rerank and spec.retrieve.rerank and spec.rerank is not None:
-            reranker = _reranker_for(
-                spec.rerank.model,
-                jina_api=spec.rerank.provider == "jina",
-            )
+            return QueryResult(query=query, hits=[])
+        embedder = embedder_for(config, spec)
         if sparse:
             result = search_sparse(
                 query=query,
@@ -181,11 +151,15 @@ def _search_entry(
                 embedder=embedder,
                 store=store,
                 limit=limit,
-                groups=groups,
-                tags=tags,
+                facets=facets,
+                exclude=exclude,
                 space=space,
             )
         else:
+            want = spec.retrieve.rerank if use_rerank is None else use_rerank
+            reranker = None
+            if want and spec.rerank is not None:
+                reranker = _reranker_for(spec.rerank.model, jina_api=spec.rerank.provider == "jina")
             result = search(
                 query=query,
                 config=config,
@@ -193,22 +167,44 @@ def _search_entry(
                 store=store,
                 reranker=reranker,
                 limit=limit,
-                use_rerank=use_rerank,
-                groups=groups,
-                tags=tags,
+                use_rerank=want,
+                facets=facets,
+                exclude=exclude,
                 space=space,
             )
         for hit in result.hits:
             hit.project = entry.name
-        return result.hits, config, reranker if spec.retrieve.rerank else None
+        return result
     finally:
         store.close()
 
 
+# -- caches ------------------------------------------------------------------------
+# One MCP process serves every chat. Building an embedder loads the BM25 ONNX model,
+# and a local reranker loads a cross-encoder, so both are kept for the process.
+
+_cache_lock = threading.Lock()
+_embedders: dict[tuple[str, str, str, int | None], Embedder] = {}
+_rerankers: dict[tuple[str, bool], Reranker] = {}
+
+
+def embedder_for(config: RagConfig, spec: SpaceConfig) -> Embedder:
+    from bc_rag.runtime import make_embedder
+
+    key = (spec.dense.provider, spec.dense.model, spec.sparse.model, spec.dimensions)
+    with _cache_lock:
+        cached = _embedders.get(key)
+        if cached is None:
+            cached = make_embedder(config, spec)
+            _embedders[key] = cached
+        return cached
+
+
 def _reranker_for(model: str, *, jina_api: bool = False) -> Reranker:
     key = (model, jina_api)
-    cached = _reranker_cache.get(key)
-    if cached is None:
-        cached = Reranker(model, jina_api=jina_api)
-        _reranker_cache[key] = cached
-    return cached
+    with _cache_lock:
+        cached = _rerankers.get(key)
+        if cached is None:
+            cached = Reranker(model, jina_api=jina_api)
+            _rerankers[key] = cached
+        return cached

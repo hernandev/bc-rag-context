@@ -1,152 +1,125 @@
-"""Bedrock sidecar keys, stored as `key:value` tags.
+"""Facets: the one label format, from `.bc-rag.json` to search results.
 
-Same names and values as bc-project-bundler metadataAttributes.
+A facet is a key with one value or a list of values:
+
+    {"area": "engine", "scope": "internal", "provider": ["olo", "toast"]}
+
+The same object, always named `facets`, appears on config groups, `groupsCommand`
+output, files, chunks, the corpus sidecar, the Qdrant payload, MCP search and
+listing, and the CLI. bc-rag stores and returns every value as a list.
+
+Search semantics: values under one key are any-of; different keys must all match.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
-SIDECAR_KEYS = (
-    "scope",
-    "system",
-    "lifecycle",
-    "area",
-    "content_type",
-    "package",
-    "layer",
-    "vendor",
-    "provider",
-    "section",
-    "corpus",
-    "method",
-    "apiPath",
-    "operationId",
-    "tag",
-    "specSlug",
-    "domain",
-    "aka",
-    "traceStatusClass",
-    "typeSafetyClass",
-    "at",
-    "day",
-    "role",
-)
+Facets = dict[str, list[str]]
 
-_OPERATION_HEADING = re.compile(
-    r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+(\S+)$"
-)
-_OPERATION_ID = re.compile(r"\*\*Operation ID\*\*:\s*`([^`]+)`")
-_OPERATION_TAG = re.compile(r"\*\*Tags\*\*:\s*(.+)")
+FACET_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+# Keys bc-rag sets itself. A config facet with one of these names is rejected.
+RESERVED_KEYS: dict[str, str] = {
+    "group": "the config group that claimed the file",
+    "specSlug": "one OpenAPI spec file",
+    "method": "the HTTP method of one OpenAPI operation",
+    "apiPath": "the path of one OpenAPI operation (prefer search_sparse for it)",
+    "operationId": "the operationId of one OpenAPI operation (prefer search_sparse for it)",
+    "apiTag": "the OpenAPI tags of the operation",
+    "at": "a chat transcript turn's timestamp",
+    "day": "a chat transcript turn's day, YYYY-MM-DD",
+    "role": "a chat transcript turn's speaker, user or agent",
+}
 
 
-_NX_KEY = re.compile(r"^nx-[A-Za-z0-9_-]+$")
+def normalize_facets(raw: Any, *, where: str = "facets") -> Facets:
+    """Validate the shape and return key -> list of values. Raises ValueError naming the problem."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be an object of key -> value or list of values")
+    result: Facets = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not FACET_KEY.fullmatch(key):
+            raise ValueError(
+                f"{where}: facet key {key!r} must start with a letter and use only "
+                "letters, digits, _ and -"
+            )
+        items = value if isinstance(value, list) else [value]
+        values: list[str] = []
+        for item in items:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    f"{where}: facet {key!r} has value {item!r}; values are non-empty strings"
+                )
+            text = item.strip()
+            if text not in values:
+                values.append(text)
+        if not values:
+            raise ValueError(f"{where}: facet {key!r} has no values")
+        result[key] = values
+    return result
 
 
-def is_filter_key(key: str) -> bool:
-    """Sidecar keys, plus raw Nx tags stored as `nx-group`, `nx-layer`, and so on."""
-    return key == "group" or key in SIDECAR_KEYS or _NX_KEY.fullmatch(key) is not None
+def check_not_reserved(facets: Facets, *, where: str = "facets") -> None:
+    for key in facets:
+        if key in RESERVED_KEYS:
+            raise ValueError(f"{where}: facet key {key!r} is set by bc-rag; pick another name")
 
 
-def parse_tag_clause(raw: str) -> tuple[str, str] | None:
-    """Split `vendor:olo` or `vendor=olo` into a filter key and value."""
-    text = raw.strip()
-    if not text:
-        return None
-    for separator in (":", "="):
-        if separator not in text:
-            continue
-        key, value = text.split(separator, 1)
-        key = key.strip()
-        value = value.strip()
-        if is_filter_key(key) and value:
-            return key, value
-    return None
+def with_facet(facets: Facets, key: str, values: str | list[str]) -> Facets:
+    """A copy of `facets` with `key` set to `values`."""
+    items = [values] if isinstance(values, str) else list(values)
+    return {**facets, key: [item for item in items if item]}
 
 
-def distinct_tag_values(groups: list) -> list[tuple[str, list[str]]]:
-    """Tag keys and their distinct values, from enabled groups only."""
+def facets_line(facets: Facets) -> str:
+    """`area=engine, provider=olo|toast`, for the dense embedding header."""
+    return ", ".join(f"{key}={'|'.join(values)}" for key, values in facets.items())
+
+
+def parse_facet_options(items: list[str] | None, *, option: str) -> Facets:
+    """`--facet key=value` flags, repeated, into one facets object. Raises ValueError."""
+    raw: dict[str, list[str]] = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip() or not value.strip():
+            raise ValueError(f"{option} {item!r} must look like key=value")
+        raw.setdefault(key.strip(), []).append(value.strip())
+    return normalize_facets(raw, where=option)
+
+
+def facets_match(have: Facets, wanted: Facets | None, excluded: Facets | None = None) -> bool:
+    """Search semantics on one object: any-of within a key, all keys, none of `excluded`."""
+    for key, values in (wanted or {}).items():
+        if not set(have.get(key, [])) & set(values):
+            return False
+    for key, values in (excluded or {}).items():
+        if set(have.get(key, [])) & set(values):
+            return False
+    return True
+
+
+def distinct_facet_values(groups: list) -> dict[str, list[str]]:
+    """Every facet key on enabled groups, with its distinct values, plus `group` names."""
     values: dict[str, set[str]] = {}
     for group in groups:
         if not getattr(group, "enabled", True):
             continue
-        for tag in getattr(group, "tags", None) or []:
-            if ":" in tag:
-                key, value = tag.split(":", 1)
-            else:
-                key, value = tag, ""
-            values.setdefault(key, set()).add(value)
-    return [(key, sorted(values[key])) for key in sorted(values)]
+        values.setdefault("group", set()).add(group.name)
+        for key, items in (getattr(group, "facets", None) or {}).items():
+            values.setdefault(key, set()).update(items)
+    return {key: sorted(values[key]) for key in sorted(values)}
 
 
-def tag_branches(tags: list | None) -> list[list[str]] | None:
-    """Outer list is OR. A nested list, or a comma-joined string, is AND.
+# -- facets bc-rag sets on OpenAPI chunks -----------------------------------------
 
-    ["a:b", ["a:c", "z:y"]] matches a:b, or both a:c and z:y.
-    """
-    if not tags:
-        return None
-    branches: list[list[str]] = []
-    for item in tags:
-        if isinstance(item, str):
-            parts = [part.strip() for part in item.split(",") if part.strip()]
-            if parts:
-                branches.append(parts)
-            continue
-        if isinstance(item, (list, tuple)):
-            terms: list[str] = []
-            for sub in item:
-                if not isinstance(sub, str):
-                    raise ValueError("a tag group must be a list of strings")
-                terms.extend(part.strip() for part in sub.split(",") if part.strip())
-            if terms:
-                branches.append(terms)
-            continue
-        raise ValueError("tags must be strings or lists of strings")
-    return branches or None
-
-
-def _one_branch_matches(have: list[str], terms: list[str]) -> bool:
-    owned = list(have)
-    wanted: dict[str, set[str]] = {}
-    rejected: dict[str, set[str]] = {}
-    raw: list[str] = []
-    raw_rejected: list[str] = []
-    for query in terms:
-        negated = query.startswith("-") and len(query) > 1
-        body = query[1:] if negated else query
-        clause = parse_tag_clause(body)
-        if clause is None:
-            (raw_rejected if negated else raw).append(body.strip())
-            continue
-        key, value = clause
-        (rejected if negated else wanted).setdefault(key, set()).add(value)
-    present: dict[str, set[str]] = {}
-    for tag in owned:
-        clause = parse_tag_clause(tag)
-        if clause is None:
-            continue
-        key, value = clause
-        present.setdefault(key, set()).add(value)
-    for key, values in wanted.items():
-        if not present.get(key, set()) & values:
-            return False
-    for key, values in rejected.items():
-        if present.get(key, set()) & values:
-            return False
-    if any(item in owned for item in raw_rejected):
-        return False
-    return all(item in owned for item in raw)
-
-
-def tags_match(have: list[str] | None, queries: list | None) -> bool:
-    """True when any top-level alternative matches. A nested list must all match."""
-    branches = tag_branches(queries)
-    if not branches:
-        return True
-    owned = list(have or [])
-    return any(_one_branch_matches(owned, branch) for branch in branches)
+_OPERATION_HEADING = re.compile(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+(\S+)$")
+_OPERATION_ID = re.compile(r"\*\*Operation ID\*\*:\s*`([^`]+)`")
+_OPERATION_TAGS = re.compile(r"\*\*Tags\*\*:\s*(.+)")
 
 
 def spec_slug_from_rel(rel_path: str) -> str | None:
@@ -171,55 +144,41 @@ def operation_from_heading_path(heading_path: str | None) -> tuple[str, str] | N
     return None
 
 
-def operation_id_and_tag(text: str) -> tuple[str | None, str | None]:
+def operation_id_and_tags(text: str) -> tuple[str | None, list[str]]:
+    """The operationId and every OpenAPI tag listed under one operation heading."""
     op_id = _OPERATION_ID.search(text)
-    op_tag = _OPERATION_TAG.search(text)
-    tag_value = None
-    if op_tag:
-        tag_value = op_tag.group(1).strip().split(",")[0].strip().strip("`")
-    return (op_id.group(1) if op_id else None, tag_value or None)
+    found = _OPERATION_TAGS.search(text)
+    tags: list[str] = []
+    if found:
+        for item in found.group(1).split(","):
+            tag = item.strip().strip("`").strip()
+            if tag and tag not in tags:
+                tags.append(tag)
+    return (op_id.group(1) if op_id else None), tags
 
 
-def apply_tag(tags: list[str], key: str, value: str) -> None:
-    item = f"{key}:{value}"
-    if item not in tags:
-        tags.append(item)
+def enrich_openapi_chunks(rel_path: str, chunks: list) -> None:
+    """Set specSlug, method, apiPath, operationId and apiTag on the chunks of one spec.md.
 
-
-def enrich_openapi_chunks(rel_path: str, chunks: list, metadata: dict[str, str] | None = None) -> None:
-    """Add specSlug / method / apiPath / operationId / tag onto OpenAPI heading chunks."""
+    Chunks under one operation's sub-headings carry that operation's facets too, so
+    `{"apiPath": "/baskets/create"}` gathers every chunk of the operation.
+    """
     slug = spec_slug_from_rel(rel_path)
-    current: dict[str, str] = {}
-    if slug:
-        current["specSlug"] = slug
+    base: Facets = {"specSlug": [slug]} if slug else {}
+    current: Facets = dict(base)
     for chunk in chunks:
-        extras = dict(current)
-        found = operation_from_heading_path(getattr(chunk, "heading_path", None))
-        if found is not None:
-            extras["method"], extras["apiPath"] = found
-            op_id, op_tag = operation_id_and_tag(getattr(chunk, "text", "") or "")
-            if op_id:
-                extras["operationId"] = op_id
-            if op_tag:
-                extras["tag"] = op_tag
-            current = dict(extras)
+        heading = getattr(chunk, "heading_path", None) or ""
+        found = operation_from_heading_path(heading)
+        if found is None:
+            current = dict(base)
         else:
-            needle_method = current.get("method")
-            needle_path = current.get("apiPath")
-            heading = getattr(chunk, "heading_path", None) or ""
-            if needle_method and needle_path and f"{needle_method} {needle_path}" in heading:
-                extras = dict(current)
-            else:
-                extras = {"specSlug": slug} if slug else {}
-                current = dict(extras)
-        tags = list(getattr(chunk, "tags", None) or [])
-        meta = dict(getattr(chunk, "metadata", None) or {})
-        if metadata:
-            meta.update(metadata)
-        for key, value in extras.items():
-            if not value:
-                continue
-            apply_tag(tags, key, value)
-            meta[key] = value
-        chunk.tags = tags
-        chunk.metadata = meta
+            method, api_path = found
+            if current.get("method") != [method] or current.get("apiPath") != [api_path]:
+                # a new operation. Its sub-heading chunks keep these facets.
+                current = {**base, "method": [method], "apiPath": [api_path]}
+            op_id, tags = operation_id_and_tags(getattr(chunk, "text", "") or "")
+            if op_id:
+                current["operationId"] = [op_id]
+            if tags:
+                current["apiTag"] = tags
+        chunk.facets = {**chunk.facets, **current}

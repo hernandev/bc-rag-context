@@ -1,9 +1,10 @@
 import re
 from pathlib import Path
 
+from tests.support import default_files_config, entry_for, space_config
+
 from bc_rag.chunking import Chunk
 from bc_rag.config import SourceGroup
-from tests.support import default_files_config, space_config
 from bc_rag.embeddings import SparseVec
 from bc_rag.indexer import Indexer, take_http_batch
 from bc_rag.query import search
@@ -57,19 +58,18 @@ def _tokens(text: str) -> list[str]:
 
 
 def test_index_then_query_finds_symbol(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("bc_rag.indexer.register_project", lambda root: None)
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "Location.ts").write_text(TS, encoding="utf-8")
-    config = default_files_config(follow_gitignore=False)
-    store = HybridStore(config.qdrant_path(tmp_path))
+    config = default_files_config()
+    store = HybridStore(tmp_path / "qdrant-local")
     embedder = FakeEmbedder()
     try:
-        stats = Indexer(tmp_path, config, embedder, store).run()
+        stats = Indexer(entry_for(tmp_path),config, embedder, store).run()
         assert stats.indexed_files == 1
         assert stats.chunks >= 1
         assert store.count() == stats.chunks
 
-        again = Indexer(tmp_path, config, embedder, store).run()
+        again = Indexer(entry_for(tmp_path),config, embedder, store).run()
         assert again.skipped_unchanged == 1
         assert again.indexed_files == 0
 
@@ -92,7 +92,7 @@ def test_index_then_query_finds_symbol(tmp_path: Path, monkeypatch) -> None:
             store=store,
             reranker=None,
             use_rerank=False,
-            groups=["no-such-group"],
+            facets={"group": ["no-such-group"]},
         )
         assert empty.hits == []
         grouped = search(
@@ -102,29 +102,36 @@ def test_index_then_query_finds_symbol(tmp_path: Path, monkeypatch) -> None:
             store=store,
             reranker=None,
             use_rerank=False,
-            groups=["default"],
+            facets={"group": ["default"]},
         )
         assert grouped.hits
-        names = [name for name, _count in store.facet_values("group")]
-        assert "default" in names
+        assert grouped.hits[0].facets["group"] == ["default"]
+        excluded = search(
+            query="firstPresent null overlay",
+            config=config,
+            embedder=embedder,
+            store=store,
+            reranker=None,
+            use_rerank=False,
+            exclude={"group": ["default"]},
+        )
+        assert excluded.hits == []
     finally:
         store.close()
 
 
 def test_many_tiny_files_index_through_pipeline(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("bc_rag.indexer.register_project", lambda root: None)
     src = tmp_path / "docs"
     src.mkdir()
     for index in range(20):
         (src / f"n{index}.md").write_text(f"# note {index}\n\none line.\n", encoding="utf-8")
     config = space_config(
-        follow_gitignore=False,
         groups=[SourceGroup(name="docs", space="prose", include=["docs/**/*.md"])],
     )
-    store = HybridStore(config.qdrant_path(tmp_path))
+    store = HybridStore(tmp_path / "qdrant-local")
     embedder = FakeEmbedder()
     try:
-        stats = Indexer(tmp_path, config, embedder, store).run()
+        stats = Indexer(entry_for(tmp_path),config, embedder, store).run()
         assert stats.indexed_files == 20
         assert stats.chunks >= 20
     finally:
@@ -132,38 +139,38 @@ def test_many_tiny_files_index_through_pipeline(tmp_path: Path, monkeypatch) -> 
 
 
 def test_failed_post_does_not_skip_on_next_index(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("bc_rag.indexer.register_project", lambda root: None)
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "Location.ts").write_text(TS, encoding="utf-8")
-    config = default_files_config(follow_gitignore=False)
-    store = HybridStore(config.qdrant_path(tmp_path))
+    store = HybridStore(tmp_path / "qdrant-local")
 
     class BoomEmbedder(FakeEmbedder):
         def embed_docs(self, dense_texts, sparse_texts):
             raise RuntimeError("post failed")
 
     first = space_config(
-        follow_gitignore=False,
-        groups=[SourceGroup(name="src", space="prose", include=["src/**/*.ts"], tags=["scope:internal"])],
+        groups=[
+            SourceGroup(
+                name="src", space="prose", include=["src/**/*.ts"], facets={"scope": "internal"}
+            )
+        ],
     )
     second = space_config(
-        follow_gitignore=False,
         groups=[
             SourceGroup(
                 name="src",
                 space="prose",
                 include=["src/**/*.ts"],
-                tags=["scope:internal", "area:engine"],
+                facets={"scope": "internal", "area": "engine"},
             )
         ],
     )
     try:
-        Indexer(tmp_path, first, FakeEmbedder(), store).run()
+        Indexer(entry_for(tmp_path),first, FakeEmbedder(), store).run()
         try:
-            Indexer(tmp_path, second, BoomEmbedder(), store).run()
+            Indexer(entry_for(tmp_path),second, BoomEmbedder(), store).run()
         except Exception:
             pass
-        again = Indexer(tmp_path, second, FakeEmbedder(), store).run()
+        again = Indexer(entry_for(tmp_path),second, FakeEmbedder(), store).run()
         assert again.skipped_unchanged == 0
         assert again.indexed_files == 1
     finally:
@@ -219,6 +226,24 @@ def test_chunk_embed_prefix_does_not_enter_sparse() -> None:
     assert "File:" not in chunk.sparse_text()
 
 
+def test_embed_header_lists_the_facets() -> None:
+    chunk = Chunk(
+        path="src/a.ts",
+        language="typescript",
+        kind="function",
+        symbol=None,
+        heading_path=None,
+        start_line=1,
+        end_line=1,
+        start_byte=0,
+        end_byte=1,
+        text="x",
+        facets={"area": ["engine"], "provider": ["olo", "toast"]},
+    )
+    assert "Facets: area=engine, provider=olo|toast" in chunk.embed_text().splitlines()
+    assert "Facets" not in chunk.sparse_text()
+
+
 def test_oversized_context_chunk_splits_under_char_budget() -> None:
     from bc_rag.indexer import _context_char_budget, _halve_chunk, _shrink_context_batch
 
@@ -272,7 +297,6 @@ def test_two_spaces_share_one_index_panel(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.ts").write_text(TS, encoding="utf-8")
     config = space_config(
-        follow_gitignore=False,
         groups=[
             SourceGroup(name="docs", space="prose", include=["docs/**/*.md"]),
             SourceGroup(name="src", space="code", include=["src/**/*.ts"]),
@@ -292,8 +316,8 @@ def test_two_spaces_share_one_index_panel(tmp_path: Path, monkeypatch) -> None:
     try:
         stats = index_spaces(
             [
-                Indexer(tmp_path, config, FakeEmbedder(), prose, console, space="prose"),
-                Indexer(tmp_path, config, FakeEmbedder(), code, console, space="code"),
+                Indexer(entry_for(tmp_path),config, FakeEmbedder(), prose, console, space="prose"),
+                Indexer(entry_for(tmp_path),config, FakeEmbedder(), code, console, space="code"),
             ]
         )
         assert stats.indexed_files == 2

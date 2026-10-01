@@ -17,7 +17,12 @@ def test_load_config_allows_line_comments(tmp_path: Path) -> None:
     }
   },
   "groups": [
-    { "name": "docs-bigcolony-reference", "space": "prose", "include": ["docs/**/*.md"], "priority": 80 }
+    {
+      "name": "docs-bigcolony-reference",
+      "space": "prose",
+      "include": ["docs/**/*.md"],
+      "priority": 80
+    }
     // {
     //   "name": "libs-testing-mock-core-testing-mock-core-faker",
     //   "include": ["libs/testing/**/src/**/*.ts"],

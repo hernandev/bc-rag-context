@@ -7,7 +7,10 @@ from bc_rag.plan import chunks_for_user_path, file_strategy, iter_index_files
 
 def test_files_plan_names_chunker_and_embed(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "one.ts").write_text("export function one() { return 1 }\n", encoding="utf-8")
+    (tmp_path / "src" / "one.ts").write_text(
+        "export function one() { return 1 }\n",
+        encoding="utf-8",
+    )
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "note.md").write_text("# Note\n\nhello\n", encoding="utf-8")
     (tmp_path / ".bc-rag.json").write_text(

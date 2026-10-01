@@ -1,26 +1,30 @@
 """Pick files from named source groups.
 
 Include and exclude are expanded on the filesystem. Git is not consulted
-for the candidate list. A group name is the tag stored on the chunk.
+for the candidate list.
 
 Ingest order is highest `priority` first, then the group name. List order in
-JSON does not matter for ingest.
+JSON does not matter for ingest. Within one space, the first group to match a
+file claims it, and the file carries only that group's facets.
 """
 
 from __future__ import annotations
 
+import os
+import stat
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
-from wcmatch.glob import BRACE, DOTGLOB, GLOBSTAR, NODIR, glob, globmatch
+from wcmatch.glob import BRACE, DOTGLOB, GLOBSTAR, NODIR, glob
+from wcmatch.glob import compile as compile_globs
 
 from bc_rag import catalog
-from bc_rag.config import ChunkConfig, EmbedConfig, RagConfig, SourceGroup
+from bc_rag.config import ChunkConfig, RagConfig, SourceGroup
 from bc_rag.defaults import HARD_EXCLUDE_DIR_NAMES, LANGUAGE_BY_SUFFIX, OPENAPI_LANGUAGE
-from bc_rag.facets import parse_tag_clause
-from bc_rag.nx_tags import NxProject, NxProjectIndex
+from bc_rag.facets import Facets
 
 _GLOB_FLAGS = GLOBSTAR | BRACE | DOTGLOB
 _EXPAND_FLAGS = GLOBSTAR | BRACE | DOTGLOB | NODIR
@@ -32,15 +36,12 @@ class SourceFile:
         "rel_path",
         "language",
         "size",
-        "tags",
-        "metadata",
+        "facets",
         "group",
-        "config_group",
         "priority",
         "chunk",
-        "embed",
         "space",
-        "explicit_dense",
+        "mtime_ns",
     )
 
     def __init__(
@@ -49,29 +50,26 @@ class SourceFile:
         rel_path: str,
         language: str,
         size: int,
-        tags: list[str] | None = None,
-        metadata: dict[str, str] | None = None,
+        facets: Facets | None = None,
         group: str | None = None,
-        config_group: str | None = None,
         priority: int = 0,
         chunk: ChunkConfig | None = None,
-        embed: EmbedConfig | None = None,
         space: str | None = None,
-        explicit_dense: str | None = None,
+        mtime_ns: int = 0,
     ) -> None:
         self.path = path
         self.rel_path = rel_path
         self.language = language
         self.size = size
-        self.tags = tags or []
-        self.metadata = dict(metadata or {})
+        # the modification time read with the size. 0 when unknown: index then hashes.
+        self.mtime_ns = mtime_ns
+        # the claiming group's facets. bc-rag adds `group` and its own keys per chunk.
+        self.facets: Facets = dict(facets or {})
+        # the name of the config group that claimed the file.
         self.group = group
-        self.config_group = config_group
         self.priority = priority
         self.chunk = chunk
-        self.embed = embed
         self.space = space
-        self.explicit_dense = explicit_dense
 
 
 @dataclass(slots=True)
@@ -85,8 +83,14 @@ class GroupResolveStats:
     skipped: bool
 
 
+def _require_groups(config: RagConfig) -> None:
+    if config.is_partial():
+        raise ValueError("this config was loaded without groupsCommand and cannot match files")
+
+
 def debug_resolve_groups(root: Path, config: RagConfig) -> list[GroupResolveStats]:
     """Time include expansion per group. Disabled groups are not globbed."""
+    _require_groups(config)
     root = root.resolve()
     stats: list[GroupResolveStats] = []
     configured = list(config.groups) if config.groups else list(config.resolved_groups())
@@ -152,12 +156,19 @@ def source_for_path(
     path: Path,
     config: RagConfig,
     *,
-    nx_index: NxProjectIndex | None = None,
     matched_group: SourceGroup | None = None,
+    space: str | None = None,
+    walked: bool = False,
 ) -> SourceFile | None:
-    if _is_hard_excluded(rel):
-        return None
-    if _is_under_user_store(path):
+    """The file as index sees it in one space.
+
+    Without `matched_group`, the highest-priority enabled group that matches claims it,
+    the same group a full pass would pick. `space` limits the candidates to that space.
+    `walked` means the path came from the group's own glob, which already dropped
+    hard-excluded folders and the user store.
+    """
+    _require_groups(config)
+    if not walked and (_is_hard_excluded(rel) or _is_under_user_store(path)):
         return None
     if matched_group is not None:
         if not matched_group.enabled:
@@ -169,7 +180,7 @@ def source_for_path(
         matches = [
             group
             for group in config.resolved_groups()
-            if _group_accepts(rel, path, group, config)
+            if (space is None or group.space == space) and _group_accepts(rel, path, group, config)
         ]
         if not matches:
             return None
@@ -179,27 +190,25 @@ def source_for_path(
     if language is None:
         return None
     size = 0
-    if path.is_file():
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return None
-    nx_project = nx_index.project_for(path) if nx_index is not None else None
-    group_name = nx_project.canonical if nx_project is not None else primary.name
+    mtime_ns = 0
+    try:
+        info = path.stat()
+    except OSError:
+        info = None
+    if info is not None and stat.S_ISREG(info.st_mode):
+        size = info.st_size
+        mtime_ns = info.st_mtime_ns
     return SourceFile(
         path=path,
         rel_path=rel,
         language=language,
         size=size,
-        tags=_merge_tags(matches, nx_project),
-        metadata=_merge_metadata(matches),
-        group=group_name,
-        config_group=primary.name,
+        facets=primary.facets,
+        group=primary.name,
         priority=primary.priority,
         chunk=_chunk_for(config, primary),
-        embed=None,
         space=primary.space,
-        explicit_dense=None,
+        mtime_ns=mtime_ns,
     )
 
 
@@ -212,8 +221,8 @@ def iter_source_groups(
 
     Disabled groups are skipped unless their name is in `include_disabled`.
     """
+    _require_groups(config)
     root = root.resolve()
-    nx_index = NxProjectIndex(root)
     seen: set[tuple[str, str]] = set()
     groups = sorted(
         config.groups or config.resolved_groups(),
@@ -233,13 +242,10 @@ def iter_source_groups(
                 continue
             path = root / relative_path
             source = source_for_path(
-                relative_path,
-                path,
-                config,
-                nx_index=nx_index,
-                matched_group=group,
+                relative_path, path, config, matched_group=group, walked=True
             )
-            if source is None or not path.is_file():
+            # a modification time means source_for_path already saw a regular file.
+            if source is None or (not source.mtime_ns and not path.is_file()):
                 continue
             seen.add(key)
             files.append(source)
@@ -252,43 +258,35 @@ def iter_source_files(root: Path, config: RagConfig) -> Iterator[SourceFile]:
         yield from files
 
 
-def _merge_tags(groups: list[SourceGroup], nx_project: NxProject | None) -> list[str]:
-    del nx_project
-    tags: list[str] = []
-    for group in groups:
-        # The config group name is a tag, so query can filter group:name like any other tag.
-        label = f"group:{group.name}"
-        if label not in tags:
-            tags.append(label)
-        for item in group.tags:
-            if item and item not in tags:
-                tags.append(item)
-    return tags
+def _user_store() -> str:
+    return _resolved_dir(str(catalog.user_dir()))
 
 
-def _is_under_user_store(path: Path) -> bool:
+def _is_under_user_store(path: Path, store: str | None = None) -> bool:
+    # resolving every file walks every folder above it. Folders resolve once, from a
+    # cache; only a file that is itself a symlink is resolved in full.
+    store = store or _user_store()
+    if path.is_symlink():
+        try:
+            target = str(path.resolve())
+        except OSError:
+            return False
+    else:
+        target = os.path.join(_resolved_dir(str(path.parent)), path.name)
+    return target == store or target.startswith(store + os.sep)
+
+
+@lru_cache(maxsize=16384)
+def _resolved_dir(directory: str) -> str:
     try:
-        path.resolve().relative_to(catalog.user_dir().resolve())
-    except (ValueError, OSError):
-        return False
-    return True
-
-
-def _merge_metadata(groups: list[SourceGroup]) -> dict[str, str]:
-    merged: dict[str, str] = {}
-    for group in groups:
-        for key, value in group.metadata.items():
-            if key and value:
-                merged[key] = value
-        for item in group.tags:
-            clause = parse_tag_clause(item)
-            if clause is not None:
-                merged[clause[0]] = clause[1]
-    return merged
+        return str(Path(directory).resolve())
+    except OSError:
+        return directory
 
 
 def _relative_paths_for_group(root: Path, config: RagConfig, group: SourceGroup) -> list[str]:
     exclude_patterns = _disk_exclude_patterns(config, group)
+    store = _user_store()
     found: list[str] = []
     seen: set[str] = set()
     for pattern in group.include:
@@ -305,7 +303,7 @@ def _relative_paths_for_group(root: Path, config: RagConfig, group: SourceGroup)
                 continue
             if _is_hard_excluded(relative_path):
                 continue
-            if _is_under_user_store(root / relative_path):
+            if _is_under_user_store(root / relative_path, store):
                 continue
             seen.add(relative_path)
             found.append(relative_path)
@@ -313,14 +311,9 @@ def _relative_paths_for_group(root: Path, config: RagConfig, group: SourceGroup)
 
 
 def _disk_exclude_patterns(config: RagConfig, group: SourceGroup) -> list[str]:
-    patterns: list[str] = []
-    for name in HARD_EXCLUDE_DIR_NAMES:
-        patterns.append(f"**/{name}/**")
-        patterns.append(f"**/{name}")
-        patterns.append(name)
-    patterns.extend(config.exclude)
-    patterns.extend(group.exclude)
-    return patterns
+    # glob checks exclude patterns against each match, not while it walks folders, so
+    # the hard-excluded folder names are left to the cheaper `_is_hard_excluded`.
+    return [*config.exclude, *group.exclude]
 
 
 def _group_accepts(rel: str, path: Path, group: SourceGroup, config: RagConfig) -> bool:
@@ -342,4 +335,10 @@ def _is_hard_excluded(rel: str) -> bool:
 def _matches_any(rel: str, patterns: list[str]) -> bool:
     if not patterns:
         return False
-    return any(globmatch(rel, pattern, flags=_GLOB_FLAGS) for pattern in patterns)
+    return _matcher(tuple(patterns)).match(rel)
+
+
+@lru_cache(maxsize=1024)
+def _matcher(patterns: tuple[str, ...]):
+    # compiling a pattern costs more than matching it, and the same lists repeat per file.
+    return compile_globs(list(patterns), flags=_GLOB_FLAGS)

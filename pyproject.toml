@@ -1,6 +1,6 @@
 [project]
 name = "bc-rag-context"
-version = "0.1.0"
+version = "0.2.0"
 description = "bc-rag-context: local hybrid retrieval. Binary nickname: bc-rag."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -27,7 +27,6 @@ dependencies = [
 
 [project.scripts]
 bc-rag = "bc_rag.cli:app"
-bc-rag-split-md = "bc_rag.cli:split_md_entry"
 
 [project.optional-dependencies]
 dev = [
@@ -44,7 +43,8 @@ packages = ["src/bc_rag"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "." lets tests import `tests.support` under a plain `pytest` run.
+pythonpath = ["src", "."]
 
 [tool.ruff]
 line-length = 100

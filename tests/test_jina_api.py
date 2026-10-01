@@ -121,6 +121,75 @@ def test_rate_limiter_records_requests() -> None:
     assert sum(tokens for _, tokens in limiter._tokens) == 20
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _retry_after_429_then_ok(module, monkeypatch, clock: _FakeClock) -> list[float]:
+    import email.message
+    import io
+    import urllib.error
+
+    sent: list[float] = []
+
+    class Response:
+        headers = email.message.Message()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(request, timeout):
+        sent.append(clock.now)
+        if len(sent) == 1:
+            headers = email.message.Message()
+            headers["Retry-After"] = "2"
+            raise urllib.error.HTTPError(request.full_url, 429, "slow", headers, io.BytesIO(b""))
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+    return sent
+
+
+def test_429_waits_before_the_same_thread_retries(monkeypatch) -> None:
+    from bc_rag import jina_api
+
+    clock = _FakeClock()
+    monkeypatch.setattr(jina_api.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(jina_api.time, "sleep", clock.sleep)
+    sent = _retry_after_429_then_ok(jina_api, monkeypatch, clock)
+    result = jina_api._post_json(
+        "https://x", {}, api_key="k", limiter=jina_api.RateLimiter(), tokens=1
+    )
+    assert result == {"ok": True}
+    assert len(sent) == 2
+    assert sent[1] - sent[0] >= 2.0
+
+
+def test_voyage_429_honours_retry_after(monkeypatch) -> None:
+    from bc_rag import jina_api, voyage_api
+
+    clock = _FakeClock()
+    monkeypatch.setattr(jina_api.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(jina_api.time, "sleep", clock.sleep)
+    monkeypatch.setattr(voyage_api, "_limiters", {})
+    sent = _retry_after_429_then_ok(voyage_api, monkeypatch, clock)
+    voyage_api._post_json("https://x", {}, api_key="k", model="voyage-4", tokens=1)
+    assert sent[1] - sent[0] >= 2.0
+
+
 def test_shared_429_cooldown_blocks_then_clears() -> None:
     limiter = RateLimiter()
     delay = limiter.note_429(0.05)

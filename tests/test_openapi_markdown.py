@@ -29,6 +29,18 @@ def test_webhook_only_spec_renders(tmp_path: Path) -> None:
     assert "entitiesWebhook" in body
 
 
+def test_every_operation_tag_is_rendered(tmp_path: Path) -> None:
+    spec = tmp_path / "tags.json"
+    spec.write_text(
+        '{"openapi": "3.0.3", "info": {"title": "T", "version": "1"}, "paths": {"/b": {"post": '
+        '{"operationId": "makeBasket", "tags": ["Baskets", "Orders"], '
+        '"responses": {"200": {"description": "ok"}}}}}}',
+        encoding="utf-8",
+    )
+    body = markdown_from_spec_file(spec)
+    assert "**Tags**: Baskets, Orders" in body
+
+
 def test_parameter_ref_is_inlined(tmp_path: Path) -> None:
     spec = tmp_path / "ref.json"
     spec.write_text(

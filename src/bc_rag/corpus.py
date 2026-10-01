@@ -1,4 +1,4 @@
-"""Prepared corpus under ~/.bc-rag/{project}/corpus/.
+"""Prepared corpus under ~/.bc-rag/{project}/cache/corpus/.
 
 Each indexed document is a file plus a Bedrock sidecar, the same pair
 bc-project-bundler writes:
@@ -6,19 +6,23 @@ bc-project-bundler writes:
   {path}
   {path}.metadata.json   {"metadataAttributes": {...}}
 
-Index skip-hash is the pair. A tag change rewrites the sidecar, the sidecar
-hash misses, and that file is re-embedded. The tree can be synced to S3 later.
+The sidecar's metadataAttributes is the file's facets. Index skip-hash is the
+pair: a facet change rewrites the sidecar, the sidecar hash misses, and that file
+is re-embedded. The tree can be synced to S3 later.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from bc_rag.cache import cache_dir
 from bc_rag.defaults import CORPUS_DIRNAME
 from bc_rag.discover import SourceFile
-from bc_rag.facets import SIDECAR_KEYS, parse_tag_clause, spec_slug_from_rel
+from bc_rag.facets import Facets, spec_slug_from_rel
 from bc_rag.manifest import file_sha256
 
 METADATA_SUFFIX = ".metadata.json"
@@ -50,45 +54,45 @@ class PreparedDocument:
 
 
 def corpus_dir(project_dir: Path) -> Path:
-    return project_dir / CORPUS_DIRNAME
+    return cache_dir(project_dir) / CORPUS_DIRNAME
 
 
 def sidecar_path_for(document_path: Path) -> Path:
     return Path(str(document_path) + METADATA_SUFFIX)
 
 
-def attributes_from_source(source: SourceFile) -> dict[str, str]:
-    attributes: dict[str, str] = {}
-    for key, value in source.metadata.items():
-        if key and value:
-            attributes[key] = value
-    for item in source.tags:
-        clause = parse_tag_clause(item)
-        if clause is not None:
-            attributes[clause[0]] = clause[1]
-    ordered: dict[str, str] = {}
-    for key in SIDECAR_KEYS:
-        if key in attributes:
-            ordered[key] = attributes[key]
-    for key, value in attributes.items():
-        if key not in ordered:
-            ordered[key] = value
-    return ordered
+def attributes_from_source(source: SourceFile) -> Facets:
+    """The sidecar's metadataAttributes: the file's facets plus `group`, keys sorted."""
+    attributes: Facets = dict(source.facets)
+    if source.group:
+        attributes["group"] = [source.group]
+    return {key: list(attributes[key]) for key in sorted(attributes)}
 
 
-def sidecar_json(attributes: dict[str, str]) -> str:
+def sidecar_json(attributes: Facets) -> str:
     return json.dumps({"metadataAttributes": attributes}, indent=2) + "\n"
+
+
+def sidecar_sha256(source: SourceFile) -> str:
+    """The hash the written sidecar file would have, computed without touching disk."""
+    text = sidecar_json(attributes_from_source(source))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _first(attributes: Facets, key: str) -> str | None:
+    values = attributes.get(key) or []
+    return values[0] if values else None
 
 
 def corpus_key(source: SourceFile) -> str:
     attributes = attributes_from_source(source)
-    scope = attributes.get("scope") or "internal"
+    scope = _first(attributes, "scope") or "internal"
     if scope == "external":
-        vendor = attributes.get("vendor") or attributes.get("provider") or "unknown"
+        vendor = _first(attributes, "vendor") or _first(attributes, "provider") or "unknown"
         slug = spec_slug_from_rel(source.rel_path) or Path(source.rel_path).stem
         return f"external/{vendor}/{slug}/{Path(source.path).name}"
-    system = attributes.get("system") or "bigcolony-workspaces"
-    lifecycle = attributes.get("lifecycle") or "current"
+    system = _first(attributes, "system") or "bigcolony-workspaces"
+    lifecycle = _first(attributes, "lifecycle") or "current"
     rel = source.rel_path
     if rel.startswith("openapi-md/"):
         rel = rel[len("openapi-md/") :]
@@ -116,25 +120,6 @@ def _write_if_changed(path: Path, text: str) -> None:
     path.write_bytes(encoded)
 
 
-def bundle_sources(root: Path, config) -> tuple[list[PreparedDocument], list[str]]:
-    from bc_rag.discover import iter_source_groups
-    from bc_rag.split_md import materialize_openapi_sources
-
-    written: list[PreparedDocument] = []
-    keep: set[str] = set()
-    project_dir = config.project_dir(root)
-    for _group, files in iter_source_groups(root, config):
-        for source in materialize_openapi_sources(root, config, files):
-            try:
-                prepared = prepare_document(project_dir, source)
-            except (OSError, UnicodeDecodeError):
-                continue
-            written.append(prepared)
-            keep.add(prepared.key)
-    pruned = prune_corpus(project_dir, keep)
-    return written, pruned
-
-
 def delete_corpus_key(project_dir: Path, key: str) -> list[Path]:
     if not key:
         return []
@@ -153,21 +138,29 @@ def prune_corpus(project_dir: Path, keep_keys: set[str]) -> list[str]:
     if not root.is_dir():
         return []
     pruned: list[str] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        key = rel[: -len(METADATA_SUFFIX)] if rel.endswith(METADATA_SUFFIX) else rel
-        if key in keep_keys:
-            continue
-        path.unlink()
-        pruned.append(rel)
-    for directory in sorted(root.rglob("*"), reverse=True):
-        if directory.is_dir():
+    emptied: set[str] = set()
+    # one os.walk: it lists each folder once and knows files from folders without a
+    # stat per entry. The corpus holds two files per indexed file.
+    for current, _folders, names in os.walk(root):
+        prefix = os.path.relpath(current, root).replace(os.sep, "/")
+        prefix = "" if prefix == "." else f"{prefix}/"
+        for name in names:
+            rel = prefix + name
+            key = rel[: -len(METADATA_SUFFIX)] if rel.endswith(METADATA_SUFFIX) else rel
+            if key in keep_keys:
+                continue
+            os.unlink(os.path.join(current, name))
+            pruned.append(rel)
+            emptied.add(current)
+    # only the folders that just lost a file can have become empty; deepest first.
+    for folder in sorted(emptied, key=len, reverse=True):
+        path = Path(folder)
+        while path != root and path.is_relative_to(root):
             try:
-                directory.rmdir()
+                path.rmdir()
             except OSError:
-                pass
+                break
+            path = path.parent
     return pruned
 
 

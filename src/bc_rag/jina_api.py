@@ -198,7 +198,8 @@ def resolve_api_key(explicit: str | None = None) -> str:
     ).strip()
     if not key:
         raise JinaApiError(
-            f"no Jina key. Run `bc-rag config set jina-api-key <key>` or set {JINA_API_KEY_ENV}. "
+            f"no Jina key. Run `bc-rag config set jina-api-key <key> --global` "
+            f"or set {JINA_API_KEY_ENV}. "
             "Get a key at https://jina.ai/api-dashboard/key-manager"
         )
     return key
@@ -293,12 +294,13 @@ def _post_json(
     tokens: int = 0,
 ) -> dict[str, Any]:
     key = resolve_api_key(api_key)
-    if limiter is not None:
-        limiter.acquire(tokens)
     encoded = json.dumps(payload).encode("utf-8")
     last_error: Exception | None = None
     attempts = 12
     for attempt in range(attempts):
+        if limiter is not None:
+            # every attempt waits out the cooldown a 429 started, this thread's included.
+            limiter.acquire(tokens)
         request = urllib.request.Request(url, data=encoded, method="POST")
         request.add_header("Authorization", f"Bearer {key}")
         request.add_header("Content-Type", "application/json")

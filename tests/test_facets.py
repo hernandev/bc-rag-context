@@ -1,8 +1,15 @@
 from types import SimpleNamespace
 
+import pytest
+
 from bc_rag.facets import (
+    distinct_facet_values,
     enrich_openapi_chunks,
+    facets_line,
+    facets_match,
+    normalize_facets,
     operation_from_heading_path,
+    parse_facet_options,
     spec_slug_from_rel,
 )
 
@@ -14,9 +21,9 @@ def test_spec_slug_from_generated_markdown_path() -> None:
         )
         == "ordering-api-1.1.bundle"
     )
-    assert spec_slug_from_rel("docs/providers/_openapi/olo--ordering-api-1.1.bundle.openapi.json") == (
-        "ordering-api-1.1.bundle"
-    )
+    assert spec_slug_from_rel(
+        "docs/providers/_openapi/olo--ordering-api-1.1.bundle.openapi.json"
+    ) == ("ordering-api-1.1.bundle")
 
 
 def test_operation_from_heading_path() -> None:
@@ -26,88 +33,106 @@ def test_operation_from_heading_path() -> None:
     )
 
 
-def test_enrich_openapi_chunks_stamps_sidecar_operation_keys() -> None:
+def test_enrich_sets_every_operation_facet_and_keeps_the_group_facets() -> None:
     chunks = [
         SimpleNamespace(
             heading_path="APIs > POST /baskets/create",
-            text="**Operation ID**: `CreateBasket`\n**Tags**: creationRetrievalBasket\n\nCreates a basket.\n",
-            tags=["scope:external", "vendor:olo"],
-            metadata={"scope": "external", "vendor": "olo"},
+            text=(
+                "**Operation ID**: `CreateBasket`\n"
+                "**Tags**: creationRetrievalBasket, Baskets\n\nCreates a basket.\n"
+            ),
+            facets={"vendor": ["olo"], "group": ["olo-spec"]},
         ),
         SimpleNamespace(
             heading_path="APIs > POST /baskets/create > Request Body",
             text="### Request Body\n",
-            tags=["scope:external", "vendor:olo"],
-            metadata={"scope": "external", "vendor": "olo"},
+            facets={"vendor": ["olo"], "group": ["olo-spec"]},
         ),
+        SimpleNamespace(heading_path="APIs > Models", text="x", facets={"vendor": ["olo"]}),
     ]
     enrich_openapi_chunks(
         "openapi-md/docs/providers/_openapi/olo--ordering-api-1.1.bundle.openapi/spec.md",
         chunks,
     )
-    assert "specSlug:ordering-api-1.1.bundle" in chunks[0].tags
-    assert "method:POST" in chunks[0].tags
-    assert "apiPath:/baskets/create" in chunks[0].tags
-    assert chunks[0].metadata["apiPath"] == "/baskets/create"
-    assert "path" not in chunks[0].metadata
-    assert "operationId:CreateBasket" in chunks[0].tags
-    assert "tag:creationRetrievalBasket" in chunks[0].tags
-    assert chunks[1].metadata["method"] == "POST"
-    assert chunks[1].metadata["operationId"] == "CreateBasket"
-    assert chunks[1].metadata["specSlug"] == "ordering-api-1.1.bundle"
-    assert chunks[1].metadata["apiPath"] == "/baskets/create"
+    operation = {
+        "vendor": ["olo"],
+        "group": ["olo-spec"],
+        "specSlug": ["ordering-api-1.1.bundle"],
+        "method": ["POST"],
+        "apiPath": ["/baskets/create"],
+        "operationId": ["CreateBasket"],
+        "apiTag": ["creationRetrievalBasket", "Baskets"],
+    }
+    assert chunks[0].facets == operation
+    assert chunks[1].facets == operation
+    assert chunks[2].facets == {"vendor": ["olo"], "specSlug": ["ordering-api-1.1.bundle"]}
 
 
-def test_distinct_tag_values_skip_disabled_groups() -> None:
-    from types import SimpleNamespace
+def test_normalize_accepts_strings_and_lists() -> None:
+    assert normalize_facets({"area": " engine ", "provider": ["olo", "toast", "olo"]}) == {
+        "area": ["engine"],
+        "provider": ["olo", "toast"],
+    }
+    assert normalize_facets(None) == {}
 
-    from bc_rag.facets import distinct_tag_values
 
+@pytest.mark.parametrize(
+    ("raw", "named"),
+    [
+        ({"1area": "x"}, "'1area'"),
+        ({"area:x": "y"}, "'area:x'"),
+        ({"area": 3}, "3"),
+        ({"area": ["ok", ""]}, "''"),
+        ({"area": []}, "no values"),
+        (["area:engine"], "must be an object"),
+    ],
+)
+def test_normalize_names_the_bad_key_or_value(raw, named: str) -> None:
+    with pytest.raises(ValueError, match=named):
+        normalize_facets(raw)
+
+
+def test_match_is_any_of_within_a_key_and_all_across_keys() -> None:
+    have = {"scope": ["internal"], "area": ["engine"], "provider": ["olo", "toast"]}
+    assert facets_match(have, {"area": ["engine", "admin"]})
+    assert facets_match(have, {"scope": ["internal"], "provider": ["toast"]})
+    assert not facets_match(have, {"scope": ["internal"], "area": ["admin"]})
+    assert not facets_match(have, None, {"provider": ["olo"]})
+    assert facets_match(have, {"scope": ["internal"]}, {"vendor": ["olo"]})
+
+
+def test_cli_flags_build_the_same_object() -> None:
+    assert parse_facet_options(["area=engine", "area=admin", "vendor=olo"], option="--facet") == {
+        "area": ["engine", "admin"],
+        "vendor": ["olo"],
+    }
+    with pytest.raises(ValueError, match="key=value"):
+        parse_facet_options(["area"], option="--facet")
+
+
+def test_distinct_values_skip_disabled_groups_and_include_group_names() -> None:
     groups = [
-        SimpleNamespace(enabled=True, tags=["scope:internal", "area:engine", "system:bigcolony-reference"]),
-        SimpleNamespace(enabled=True, tags=["scope:external", "vendor:olo", "system:vendor-provider"]),
-        SimpleNamespace(enabled=False, tags=["scope:internal", "area:hidden"]),
+        SimpleNamespace(
+            name="eng",
+            enabled=True,
+            facets={"area": ["engine"], "scope": ["internal"]},
+        ),
+        SimpleNamespace(
+            name="olo",
+            enabled=True,
+            facets={"scope": ["external"], "vendor": ["olo"]},
+        ),
+        SimpleNamespace(name="off", enabled=False, facets={"area": ["hidden"]}),
     ]
-    assert distinct_tag_values(groups) == [
-        ("area", ["engine"]),
-        ("scope", ["external", "internal"]),
-        ("system", ["bigcolony-reference", "vendor-provider"]),
-        ("vendor", ["olo"]),
-    ]
+    assert distinct_facet_values(groups) == {
+        "area": ["engine"],
+        "group": ["eng", "olo"],
+        "scope": ["external", "internal"],
+        "vendor": ["olo"],
+    }
 
 
-def test_tag_filter_is_any_of_within_a_key() -> None:
-    from bc_rag.facets import tags_match
-
-    have = ["scope:internal", "system:bigcolony-reference", "area:engine"]
-    assert tags_match(have, ["scope:internal"])
-    assert tags_match(have, ["area:engine", "area:admin"])
-    assert not tags_match(have, ["scope:external"])
-    assert tags_match(have, ["a:b", ["scope:internal", "area:engine"]])
-    assert not tags_match(have, [["scope:internal", "area:admin"]])
-    assert not tags_match(have, [["scope:internal", "-area:engine"]])
-    assert tags_match(have, [["scope:internal", "-vendor:olo"]])
-
-
-def test_api_route_does_not_replace_the_file_path() -> None:
-    from bc_rag.chunking import Chunk
-    from bc_rag.store import _payload
-
-    chunk = Chunk(
-        path="docs/providers/_openapi/yext/accounts.md",
-        language="markdown",
-        kind="markdown",
-        symbol=None,
-        heading_path="APIs > POST /accounts/{accountId}/newlocationaddrequests",
-        start_line=10,
-        end_line=40,
-        start_byte=0,
-        end_byte=20,
-        text="creates a location",
-        tags=["apiPath:/accounts/{accountId}/newlocationaddrequests"],
-        metadata={"path": "/accounts/{accountId}/newlocationaddrequests", "vendor": "yext"},
+def test_facets_line() -> None:
+    assert facets_line({"area": ["engine"], "provider": ["olo", "toast"]}) == (
+        "area=engine, provider=olo|toast"
     )
-    payload = _payload(chunk)
-    assert payload["path"] == "docs/providers/_openapi/yext/accounts.md"
-    assert payload["apiPath"] == "/accounts/{accountId}/newlocationaddrequests"
-    assert payload["vendor"] == "yext"

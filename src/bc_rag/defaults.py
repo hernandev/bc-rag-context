@@ -1,15 +1,13 @@
-"""Built-in defaults. A project can run with no `.bc-rag.json` at all."""
+"""Built-in constants. Every project still needs its own `.bc-rag.json`."""
 
 from __future__ import annotations
 
 CONFIG_FILENAME = ".bc-rag.json"
-# Legacy on-disk folder inside a project. Live stores are ~/.bc-rag/{name}/.
-STORE_DIRNAME = ".bc-rag"
 COLLECTION_NAME = "chunks"
 QDRANT_HTTP_URL = "http://127.0.0.1:32321"
 QDRANT_HTTP_PORT = 32321
 QDRANT_GRPC_PORT = 32322
-# One shared MCP process. Chats connect here instead of spawning stdio.
+# One shared MCP process. Every chat connects here over HTTP.
 MCP_HTTP_HOST = "127.0.0.1"
 MCP_HTTP_PORT = 32323
 MCP_HTTP_PATH = "/mcp"
@@ -19,56 +17,16 @@ MCP_HTTPS_PORT = 32324
 MCP_TLS_HOST = "bc-rag.localhost"
 MCP_TLS_CERT_FILENAME = "mcp.pem"
 MCP_TLS_KEY_FILENAME = "mcp.key"
-QDRANT_DOCKER_CONTEXT = "orbstack"
-QDRANT_COMPOSE_PROJECT = "bc-rag"
 QDRANT_IMAGE = "qdrant/qdrant:v1.19.1"
 MANIFEST_FILENAME = "manifest.json"
 INDEX_LOG_FILENAME = "index.jsonl"
+# ~/.bc-rag/{name}/cache/ holds what indexing derives from the repo and can rebuild
+# without an API call: the corpus (document + sidecar per file) and rendered OpenAPI.
+CACHE_DIRNAME = "cache"
+# also the path prefix rendered specs carry in manifests and Qdrant payloads. Keep it:
+# a new prefix makes every OpenAPI file look new, and it is embedded again.
 OPENAPI_MD_DIRNAME = "openapi-md"
 CORPUS_DIRNAME = "corpus"
-JINA_STORE_DIRNAME = "jina"
-
-DEFAULT_INCLUDE: list[str] = [
-    "**/*.ts",
-    "**/*.tsx",
-    "**/*.mts",
-    "**/*.cts",
-    "**/*.vue",
-    "**/*.md",
-    "**/*.mdx",
-]
-
-# Entrypoints only. Split path/schema fragments are pulled in by Redocly bundle.
-DEFAULT_OPENAPI_INCLUDE: list[str] = [
-    "**/openapi.yaml",
-    "**/openapi.yml",
-    "**/openapi.json",
-    "**/swagger.yaml",
-    "**/swagger.yml",
-    "**/swagger.json",
-]
-
-DEFAULT_EXCLUDE: list[str] = [
-    "**/node_modules/**",
-    "**/dist/**",
-    "**/build/**",
-    "**/coverage/**",
-    "**/out/**",
-    "**/.git/**",
-    "**/.bc-rag/**",
-    "**/.venv/**",
-    "**/venv/**",
-    "**/.next/**",
-    "**/.turbo/**",
-    "**/.nx/**",
-    "**/.angular/**",
-    "**/.output/**",
-    "**/.vite/**",
-    "**/.cache/**",
-    "**/tmp/**",
-    "**/storybook-static/**",
-    "**/vendor/**",
-]
 
 # Always pruned, even if a user include glob would otherwise match.
 HARD_EXCLUDE_DIR_NAMES: frozenset[str] = frozenset(
@@ -88,13 +46,8 @@ HARD_EXCLUDE_DIR_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# English retrieval model with 8192-token context. Vendor OpenAPI descriptions
-# and internal markdown are the hard queries: same idea, different words.
-# BM25 stays in the collection as a backstop when a name is already known.
-DEFAULT_DENSE_MODEL = "jinaai/jina-embeddings-v2-base-en"
+# BM25 runs locally in every space; the starter config names it.
 DEFAULT_SPARSE_MODEL = "Qdrant/bm25"
-# 8k-context reranker, so a whole OpenAPI operation can be scored, not truncated.
-DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v1-turbo-en"
 JINA_API_URL = "https://api.jina.ai"
 JINA_API_KEY_ENV = "JINA_API_KEY"
 VOYAGE_API_URL = "https://api.voyageai.com"

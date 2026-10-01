@@ -1,4 +1,8 @@
-"""Dense + sparse embeddings. Dense/rerank may be local FastEmbed or Jina HTTP."""
+"""Dense + sparse embeddings and rerank.
+
+Dense and rerank run through the Voyage API, the Jina API, or local FastEmbed, as
+each space's config says. Sparse (BM25) always runs locally through FastEmbed.
+"""
 
 from __future__ import annotations
 

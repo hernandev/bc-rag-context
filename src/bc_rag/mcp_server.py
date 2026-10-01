@@ -1,25 +1,29 @@
-"""One MCP server for every cataloged project.
+"""One MCP server for every registered project, shared by every chat over HTTP.
 
-`bc-rag mcp` speaks over stdin for a single chat.
-`bc-rag mcp --http` listens on 127.0.0.1 so every chat shares that process.
-When `~/.bc-rag/mcp.pem` and `~/.bc-rag/mcp.key` both exist, the same process
-also listens on `https://bc-rag.localhost:32324/mcp`.
-`search` and `search_sparse` require `project` and `space`.
-`space` is required. The names are the keys of `spaces`.
+The mcp service (`bc-rag services ...`) listens on `http://127.0.0.1:32323/mcp`.
+When `~/.bc-rag/mcp.pem` and `~/.bc-rag/mcp.key` both exist, the same process also
+listens on `https://bc-rag.localhost:32324/mcp`.
+
+Tools: `list_projects`, `search`, `search_sparse`, `list_facets`. A failing tool
+returns its error text to the client; nothing is reduced to "Error executing tool".
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import signal
 import socket
 import sys
 import threading
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from bc_rag.catalog import living_projects
+from pydantic import Field
+
+from bc_rag.catalog import find_project, living_projects
 from bc_rag.defaults import (
     MCP_HTTP_HOST,
     MCP_HTTP_PATH,
@@ -29,226 +33,299 @@ from bc_rag.defaults import (
     MCP_TLS_HOST,
     MCP_TLS_KEY_FILENAME,
 )
-from bc_rag.query import search_projects
+from bc_rag.facets import RESERVED_KEYS, normalize_facets
 from bc_rag.store import Hit
 
+log = logging.getLogger("bc_rag.mcp")
 
-def run_mcp(
-    *,
-    http: bool = False,
-    host: str = MCP_HTTP_HOST,
-    port: int = MCP_HTTP_PORT,
-) -> None:
-    from mcp.server import MCPServer
+LIST_FACETS_OVERVIEW_LIMIT = 50
+LIST_FACETS_KEY_LIMIT = 1000
 
-    mcp = MCPServer(
-        "bc-rag",
-        instructions=(
-            "Search local source and docs indexed by bc-rag-context. "
-            "Call list_projects first, then list_tags for the space you will search. "
-            "search and search_sparse require project and space. "
-            "search is dense then rerank. search_sparse is BM25 only. "
-            "Pass tags only with values list_tags returned. "
-            "The tags list is or of alternatives. A nested list is and. "
-            "Prefix a tag with - to exclude that value."
-        ),
+
+def run_mcp(*, host: str = MCP_HTTP_HOST, port: int = MCP_HTTP_PORT) -> None:
+    """Serve the tools over HTTP until SIGTERM or Ctrl+C. Also HTTPS when cert files exist."""
+    if not host or host.strip() != host or any(ch.isspace() for ch in host):
+        raise ValueError(f"invalid mcp host: {host!r}")
+    if port < 1 or port > 65535:
+        raise ValueError(f"invalid mcp port: {port}")
+    mcp = build_server()
+    tls = mcp_tls_files()
+    if tls is None:
+        url = f"http://{host}:{port}{MCP_HTTP_PATH}"
+        print(f"bc-rag mcp {url}", file=sys.stderr, flush=True)
+        mcp.run(
+            transport="streamable-http",
+            host=host,
+            port=port,
+            streamable_http_path=MCP_HTTP_PATH,
+            # Each chat is its own request. No session table to leak when a chat closes.
+            stateless_http=True,
+            json_response=True,
+        )
+        return
+    cert, key = tls
+    _serve_http_and_https(mcp, host=host, port=port, cert=cert, key=key)
+
+
+def server_instructions() -> str:
+    reserved = "\n".join(f"- {key}: {meaning}" for key, meaning in RESERVED_KEYS.items())
+    return (
+        "Search local source and docs indexed by bc-rag.\n"
+        "Call list_projects first: it names each project's spaces, and its facetKeys and "
+        "hints explain the project's filters. A space is one collection; search one at "
+        "a time.\n"
+        "search embeds the query, retrieves by meaning, and reranks when the space has a "
+        "reranker. search_sparse is BM25: use it for identifiers, routes, paths, and exact "
+        "error text.\n"
+        'Filter with facets, an object of key -> value or list of values, such as '
+        '{"area": "engine", "provider": ["olo", "toast"]}. Values under one key are '
+        "any-of; different keys must all match. exclude has the same shape and removes "
+        "matches. To match one key OR another key, run two searches.\n"
+        "Values are exact strings. Call list_facets for the space first: it lists each "
+        "key with its meaning and values.\n"
+        f"Keys bc-rag sets itself:\n{reserved}\n"
+        "Project keys are described by the project's facetKeys."
     )
 
-    @mcp.tool()
-    def list_projects() -> list[dict[str, Any]]:
-        """List indexed projects and the space names search will accept."""
-        from pathlib import Path
 
+FacetsArg = Annotated[
+    dict[str, str | list[str]] | None,
+    Field(
+        description=(
+            "Only hits whose facets match. key -> value or list of values. Values under "
+            "one key are any-of; different keys must all match. Use values list_facets "
+            'returned. Examples: {"vendor": "olo"}; {"area": "engine", "apiTag": '
+            '["Baskets", "Orders"]}.'
+        )
+    ),
+]
+ExcludeArg = Annotated[
+    dict[str, str | list[str]] | None,
+    Field(
+        description=(
+            'Remove hits whose facets match. Same shape as facets: {"scope": "external"}.'
+        )
+    ),
+]
+ProjectArg = Annotated[str, Field(description="Project name from list_projects.")]
+SpaceArg = Annotated[str, Field(description="Space name from list_projects.")]
+LimitArg = Annotated[
+    int | None,
+    Field(ge=1, le=50, description="Hits to return. Omit for the space's default."),
+]
+
+
+@contextlib.contextmanager
+def _surfaced(tool: str) -> Iterator[None]:
+    """Turn any failure into a ToolError whose text reaches the client."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    try:
+        yield
+    except ToolError:
+        raise
+    except Exception as error:
+        log.exception("tool %s failed", tool)
+        raise ToolError(f"{type(error).__name__}: {error}") from error
+
+
+def _entry(project: str):
+    entries = living_projects()
+    found = find_project(project, entries)
+    if found is None:
+        known = ", ".join(entry.name for entry in entries) or "none"
+        raise ValueError(f"unknown project: {project}. Registered projects: {known}")
+    return found
+
+
+def _search_result(result, project: str, space: str, facets, exclude) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "query": result.query,
+        "project": project,
+        "space": space,
+        "reranked": result.reranked,
+        "hits": [_hit_dict(hit) for hit in result.hits],
+    }
+    if (facets or exclude) and not result.hits:
+        payload["hint"] = (
+            "no hit matched these facets. Check the values with list_facets, or drop a key."
+        )
+    return payload
+
+
+def build_server() -> Any:
+    """The MCP server with every tool registered. No listener yet."""
+    from mcp.server import MCPServer
+    from mcp.types import ToolAnnotations
+
+    mcp = MCPServer("bc-rag", instructions=server_instructions())
+    read_only = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False)
+
+    @mcp.tool(annotations=read_only)
+    def list_projects() -> list[dict[str, Any]]:
+        """List registered projects, their spaces and models, facet key meanings, and hints."""
         from bc_rag.config import load_config
 
-        rows: list[dict[str, Any]] = []
-        for entry in living_projects():
-            configuration, _path = load_config(Path(entry.root))
-            spaces = list(configuration.spaces)
-            rows.append({"name": entry.name, "root": entry.root, "spaces": spaces})
-        return rows
+        with _surfaced("list_projects"):
+            rows: list[dict[str, Any]] = []
+            for entry in living_projects():
+                try:
+                    configuration, _path = load_config(entry.root_path(), groups=False)
+                except Exception as error:
+                    # one broken project must not hide the others.
+                    rows.append(
+                        {"name": entry.name, "root": entry.root, "spaces": [], "error": str(error)}
+                    )
+                    continue
+                rows.append(
+                    {
+                        "name": entry.name,
+                        "root": entry.root,
+                        "spaces": [
+                            {
+                                "name": name,
+                                "dense": f"{spec.dense.provider} {spec.dense.model}",
+                                "rerank": (
+                                    f"{spec.rerank.provider} {spec.rerank.model}"
+                                    if spec.rerank is not None and spec.retrieve.rerank
+                                    else None
+                                ),
+                            }
+                            for name, spec in configuration.spaces.items()
+                        ],
+                        "facetKeys": configuration.facet_keys,
+                        "hints": configuration.search_hints,
+                    }
+                )
+            return rows
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only)
     def search(
-        query: str,
-        project: str,
-        space: str,
-        limit: int = 8,
-        groups: list[str] | None = None,
-        tags: list | None = None,
+        query: Annotated[str, Field(description="A question, or words that describe the code.")],
+        project: ProjectArg,
+        space: SpaceArg,
+        limit: LimitArg = None,
+        facets: FacetsArg = None,
+        exclude: ExcludeArg = None,
     ) -> dict[str, Any]:
-        """Dense search, then rerank. Does not use BM25.
+        """Search by meaning: embed the query, retrieve, then rerank when the space has a
+        reranker."""
+        from bc_rag.query import search_projects
 
-        Call list_tags for this project and space before you invent a tag value.
-
-        tags is one list of alternatives. The hit may match any alternative.
-        A string is one alternative. A nested list is one alternative whose tags must all match.
-        A tag prefixed with - excludes that value. Put the minus on that tag, inside the alternative it belongs to.
-
-        One tag. Only vendor Olo:
-        ["vendor:olo"]
-
-        Or. Vendor Olo or vendor Yext:
-        ["vendor:olo", "vendor:yext"]
-
-        And. Engine area and the reference system, both required:
-        [["area:engine", "system:bigcolony-reference"]]
-
-        Or of an and. Vendor Olo, or engine and the reference system:
-        ["vendor:olo", ["area:engine", "system:bigcolony-reference"]]
-
-        Exclude. Internal, and not vendor Olo:
-        [["scope:internal", "-vendor:olo"]]
-
-        groups is a separate list. A hit may be in any of those group names.
-        ["docs-providers-_openapi-olo", "libs-engine-providers-engine-providers-olo"]
-
-        Args:
-            query: Natural language question or an identifier.
-            project: Catalog name or absolute root. From list_projects.
-            space: Vector space. Required. From list_projects.
-            limit: Maximum hits to return.
-            groups: Group names. Any of them may match.
-            tags: Alternatives as a list of strings or nested lists. See the examples above.
-        """
-        result = search_projects(
-            query,
-            project=project,
-            space=space,
-            limit=limit,
-            use_rerank=True,
-            groups=groups,
-            tags=tags,
-        )
-        return {
-            "query": result.query,
-            "project": project,
-            "space": space,
-            "groups": groups,
-            "tags": tags,
-            "hits": [_hit_dict(hit) for hit in result.hits],
-        }
-
-    @mcp.tool()
-    def search_sparse(
-        query: str,
-        project: str,
-        space: str,
-        limit: int = 8,
-        groups: list[str] | None = None,
-        tags: list | None = None,
-    ) -> dict[str, Any]:
-        """BM25 keyword search only. No dense vector and no rerank.
-
-        Use for an identifier, a path fragment, or an exact error string.
-        Do not use for a question about what the code means.
-
-        tags works the same way as on search.
-        The list is or of alternatives. A nested list is and. A leading - excludes that value.
-
-        One tag:
-        ["vendor:olo"]
-
-        Or:
-        ["vendor:olo", "vendor:yext"]
-
-        And:
-        [["area:engine", "system:bigcolony-reference"]]
-
-        Or of an and:
-        ["vendor:olo", ["area:engine", "system:bigcolony-reference"]]
-
-        Exclude:
-        [["scope:internal", "-vendor:olo"]]
-
-        Args:
-            query: Tokens to match.
-            project: Catalog name or absolute root. From list_projects.
-            space: Vector space. Required. From list_projects.
-            limit: Maximum hits to return.
-            groups: Group names. Any of them may match.
-            tags: Alternatives as a list of strings or nested lists. See the examples above.
-        """
-        result = search_projects(
-            query,
-            project=project,
-            space=space,
-            limit=limit,
-            use_rerank=False,
-            groups=groups,
-            tags=tags,
-            sparse=True,
-        )
-        return {
-            "query": result.query,
-            "project": project,
-            "space": space,
-            "groups": groups,
-            "tags": tags,
-            "hits": [_hit_dict(hit) for hit in result.hits],
-        }
-
-    @mcp.tool()
-    def list_tags(project: str | None = None, space: str | None = None) -> dict[str, Any]:
-        """List tags stored on indexed points in one space, with point counts.
-
-        Call this before search when you need a tag. Copy a tag string into search unchanged.
-
-        Each tag is already key:value, for example area:engine or vendor:olo.
-        Do not split it. Pass that same string in the search tags list.
-
-        Args:
-            project: Catalog name or absolute root. Omit to use the first catalog entry.
-            space: Vector space. Omit to use defaultSpace. prose and code are different collections.
-        """
-        from pathlib import Path
-
-        from bc_rag.catalog import find_project
-        from bc_rag.runtime import open_session
-
-        entries = living_projects()
-        if project:
-            found = find_project(project, entries)
-            if found is None:
-                raise ValueError(f"unknown project: {project}")
-            entries = [found]
-        if not entries:
-            return {"tags": []}
-        entry = entries[0]
-        session = open_session(Path(entry.root), need_reranker=False, write=False, space=space)
-        try:
-            tags = session.store.facet_values("tags")
-        finally:
-            session.close()
-        return {
-            "project": entry.name,
-            "space": session.space,
-            "tags": [{"tag": name, "points": count} for name, count in tags],
-        }
-
-    if http:
-        if not host or host.strip() != host or any(ch.isspace() for ch in host):
-            raise ValueError(f"invalid mcp host: {host!r}")
-        if port < 1 or port > 65535:
-            raise ValueError(f"invalid mcp port: {port}")
-        tls = mcp_tls_files()
-        if tls is None:
-            url = f"http://{host}:{port}{MCP_HTTP_PATH}"
-            print(f"bc-rag mcp {url}", file=sys.stderr, flush=True)
-            mcp.run(
-                transport="streamable-http",
-                host=host,
-                port=port,
-                streamable_http_path=MCP_HTTP_PATH,
-                # Each chat is its own request. No session table to leak when a chat closes.
-                stateless_http=True,
-                json_response=True,
+        with _surfaced("search"):
+            wanted = normalize_facets(facets, where="facets")
+            unwanted = normalize_facets(exclude, where="exclude")
+            result = search_projects(
+                query,
+                project=project,
+                space=space,
+                limit=limit,
+                facets=wanted,
+                exclude=unwanted,
             )
-            return
-        cert, key = tls
-        _serve_http_and_https(mcp, host=host, port=port, cert=cert, key=key)
-        return
-    mcp.run(transport="stdio")
+            return _search_result(result, project, space, wanted, unwanted)
+
+    @mcp.tool(annotations=read_only)
+    def search_sparse(
+        query: Annotated[
+            str,
+            Field(description="An identifier, route, path fragment, or exact error text."),
+        ],
+        project: ProjectArg,
+        space: SpaceArg,
+        limit: LimitArg = None,
+        facets: FacetsArg = None,
+        exclude: ExcludeArg = None,
+    ) -> dict[str, Any]:
+        """BM25 keyword search. No dense vector and no rerank. Not for questions about
+        meaning."""
+        from bc_rag.query import search_projects
+
+        with _surfaced("search_sparse"):
+            wanted = normalize_facets(facets, where="facets")
+            unwanted = normalize_facets(exclude, where="exclude")
+            result = search_projects(
+                query,
+                project=project,
+                space=space,
+                limit=limit,
+                facets=wanted,
+                exclude=unwanted,
+                sparse=True,
+            )
+            return _search_result(result, project, space, wanted, unwanted)
+
+    @mcp.tool(annotations=read_only)
+    def list_facets(
+        project: ProjectArg,
+        space: SpaceArg,
+        key: Annotated[
+            str | None,
+            Field(description="One facet key. Omit for every key and a sample."),
+        ] = None,
+        limit: Annotated[
+            int | None,
+            Field(ge=1, le=10_000, description="Values to return per key."),
+        ] = None,
+    ) -> dict[str, Any]:
+        """List the facets stored in one space: each key with its meaning, how many
+        points carry it, and its values. Pass key to list one key's values."""
+        with _surfaced("list_facets"):
+            return facets_listing(_entry(project), space, key=key, limit=limit)
+
+    return mcp
+
+
+def facets_listing(entry, space: str, *, key: str | None, limit: int | None) -> dict[str, Any]:
+    """The list_facets answer. Reads Qdrant only; no embedder, no groupsCommand."""
+    from bc_rag.config import load_config
+    from bc_rag.store import HybridStore
+
+    root = entry.root_path()
+    config, _path = load_config(root, groups=False)
+    config.space_named(space)
+    meanings = {**config.facet_keys, **RESERVED_KEYS}
+    store = HybridStore(
+        url=config.qdrant_http_url(),
+        collection=config.qdrant_collection(root, space),
+        read_only=True,
+    )
+    try:
+        stored = store.facet_keys()
+        if key is not None:
+            if key not in stored:
+                known = ", ".join(stored) or "none"
+                raise ValueError(
+                    f"facet key {key!r} is not stored in space {space!r}. Keys here: {known}"
+                )
+            cap = limit or LIST_FACETS_KEY_LIMIT
+            values = store.facet_values(key, limit=cap + 1)
+            return {
+                "project": entry.name,
+                "space": space,
+                "key": key,
+                "meaning": meanings.get(key),
+                "points": stored[key],
+                "values": [{"value": value, "points": count} for value, count in values[:cap]],
+                "truncated": len(values) > cap,
+            }
+        cap = limit or LIST_FACETS_OVERVIEW_LIMIT
+        keys = []
+        for name, points in stored.items():
+            values = store.facet_values(name)
+            keys.append(
+                {
+                    "key": name,
+                    "meaning": meanings.get(name),
+                    "points": points,
+                    "distinct": len(values),
+                    "values": [value for value, _count in values[:cap]],
+                    "truncated": len(values) > cap,
+                }
+            )
+        return {"project": entry.name, "space": space, "keys": keys}
+    finally:
+        store.close()
 
 
 def mcp_tls_files() -> tuple[Path, Path] | None:
@@ -428,8 +505,7 @@ def _hit_dict(hit: Hit) -> dict[str, Any]:
         "kind": hit.kind,
         "symbol": hit.symbol,
         "heading_path": hit.heading_path,
-        "group": (hit.payload or {}).get("group"),
-        "tags": (hit.payload or {}).get("tags") or [],
+        "facets": hit.facets,
         "score": hit.score,
         "text": hit.text,
     }

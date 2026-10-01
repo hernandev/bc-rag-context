@@ -8,6 +8,12 @@ def isolate_bc_rag_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     home = tmp_path / "_bc_rag_home"
     home.mkdir()
     monkeypatch.setattr("bc_rag.catalog.user_dir", lambda: home)
-    # a CLI test must never start a real background daemon.
+    # a CLI test must never start real background services.
     monkeypatch.setenv("BC_RAG_DAEMON", "false")
+    monkeypatch.setattr("bc_rag.services.ensure_stack", lambda *args, **kwargs: None)
+
+    def no_spawn(*args, **kwargs):
+        raise AssertionError("a test tried to spawn a real supervisor")
+
+    monkeypatch.setattr("bc_rag.services.supervisor.spawn", no_spawn)
     return home

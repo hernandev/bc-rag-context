@@ -6,6 +6,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from bc_rag.cache import cache_dir
 from bc_rag.config import RagConfig
 from bc_rag.defaults import CORPUS_DIRNAME, OPENAPI_MD_DIRNAME
 
@@ -14,20 +15,24 @@ from bc_rag.defaults import CORPUS_DIRNAME, OPENAPI_MD_DIRNAME
 class ResetReport:
     removed: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
-    collection: str | None = None
-    collection_deleted: bool = False
-    collection_error: str | None = None
+    # One row per space: (collection name, "deleted" | "already gone" | error text).
+    collections: list[tuple[str, str]] = field(default_factory=list)
+
+
+def reset_collections(root: Path, configuration: RagConfig) -> list[str]:
+    """The Qdrant collection of every configured space."""
+    return [configuration.qdrant_collection(root, space) for space in configuration.spaces]
 
 
 def reset_targets(root: Path, configuration: RagConfig) -> list[Path]:
     project_dir = configuration.project_dir(root)
-    spaces: list[str] = list(configuration.spaces)
-    targets = [configuration.store_dir(root, space) for space in spaces]
+    targets = [configuration.store_dir(root, space) for space in configuration.spaces]
+    targets.append(cache_dir(project_dir))
+    # the places the cache lived before it had its own folder.
     targets.extend(
-        [
-            project_dir / CORPUS_DIRNAME,
-            project_dir / OPENAPI_MD_DIRNAME,
-        ]
+        path
+        for path in (project_dir / CORPUS_DIRNAME, project_dir / OPENAPI_MD_DIRNAME)
+        if path.exists()
     )
     return targets
 
@@ -35,12 +40,8 @@ def reset_targets(root: Path, configuration: RagConfig) -> list[Path]:
 def reset_project(root: Path, configuration: RagConfig) -> ResetReport:
     report = ResetReport()
     url = configuration.qdrant_http_url()
-    spaces: list[str] = list(configuration.spaces)
-    names = [configuration.qdrant_collection(root, space) for space in spaces]
-    report.collection = names[0] if names else None
-    if url:
-        for collection in names:
-            _delete_http_collection(url, collection, report)
+    for collection in reset_collections(root, configuration):
+        report.collections.append((collection, _delete_http_collection(url, collection)))
     for path in reset_targets(root, configuration):
         if not path.exists():
             report.missing.append(str(path))
@@ -53,20 +54,23 @@ def reset_project(root: Path, configuration: RagConfig) -> ResetReport:
     return report
 
 
-def _delete_http_collection(url: str, collection: str, report: ResetReport) -> None:
+def _delete_http_collection(url: str, collection: str) -> str:
     try:
         from qdrant_client import QdrantClient
 
-        client = QdrantClient(url=url, timeout=30, check_compatibility=False)
+        from bc_rag.store import qdrant_api_key
+
+        client = QdrantClient(
+            url=url, api_key=qdrant_api_key(), timeout=30, check_compatibility=False
+        )
         try:
-            if client.collection_exists(collection):
-                client.delete_collection(collection)
-                report.collection_deleted = True
-            else:
-                report.missing.append(f"qdrant collection {collection}")
+            if not client.collection_exists(collection):
+                return "already gone"
+            client.delete_collection(collection)
+            return "deleted"
         finally:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
     except Exception as error:
-        report.collection_error = str(error)
+        return str(error)

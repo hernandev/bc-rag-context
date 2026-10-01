@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stay in the caller's working directory. `bc-rag init` writes `.bc-rag.json`
-# next to cwd (or the folder argument), not next to this tool repo.
+# Stay in the caller's working directory. `bc-rag project add` writes `.bc-rag.json`
+# next to cwd (or --root), not next to this tool repo.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ -x "$ROOT/.venv/bin/bc-rag" ]]; then

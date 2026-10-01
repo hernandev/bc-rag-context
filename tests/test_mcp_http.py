@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from bc_rag.defaults import MCP_HTTP_HOST, MCP_HTTP_PATH, MCP_HTTP_PORT, MCP_TLS_HOST
 from bc_rag.mcp_server import mcp_tls_files, mcp_transport_security, run_mcp
 
@@ -9,18 +11,18 @@ class _FakeServer:
         self.name = name
         self.instructions = instructions
 
-    def tool(self):
+    def tool(self, *args, **kwargs):
         def decorate(fn):
             return fn
 
         return decorate
 
-    def run(self, transport: str = "stdio", **kwargs) -> None:
+    def run(self, transport: str, **kwargs) -> None:
         self.transport = transport
         self.kwargs = kwargs
 
 
-def test_run_mcp_stdio_is_the_default(monkeypatch) -> None:
+def _capture(monkeypatch) -> list[_FakeServer]:
     created: list[_FakeServer] = []
 
     def factory(*args, **kwargs):
@@ -29,21 +31,12 @@ def test_run_mcp_stdio_is_the_default(monkeypatch) -> None:
         return server
 
     monkeypatch.setattr("mcp.server.MCPServer", factory)
+    return created
+
+
+def test_run_mcp_listens_on_the_shared_port(monkeypatch) -> None:
+    created = _capture(monkeypatch)
     run_mcp()
-    assert created[0].transport == "stdio"
-    assert created[0].kwargs == {}
-
-
-def test_run_mcp_http_listens_on_the_shared_port(monkeypatch) -> None:
-    created: list[_FakeServer] = []
-
-    def factory(*args, **kwargs):
-        server = _FakeServer(*args, **kwargs)
-        created.append(server)
-        return server
-
-    monkeypatch.setattr("mcp.server.MCPServer", factory)
-    run_mcp(http=True)
     server = created[0]
     assert server.transport == "streamable-http"
     assert server.kwargs["host"] == MCP_HTTP_HOST
@@ -64,20 +57,20 @@ def test_https_starts_only_when_both_cert_files_exist(
         started.append((cert, key))
 
     monkeypatch.setattr("bc_rag.mcp_server._serve_http_and_https", fake_serve)
-    monkeypatch.setattr("mcp.server.MCPServer", _FakeServer)
+    _capture(monkeypatch)
 
-    run_mcp(http=True)
+    run_mcp()
     assert started == []
     assert mcp_tls_files() is None
 
     cert = isolate_bc_rag_home / "mcp.pem"
     cert.write_text("cert")
-    run_mcp(http=True)
+    run_mcp()
     assert started == []
 
     key = isolate_bc_rag_home / "mcp.key"
     key.write_text("key")
-    run_mcp(http=True)
+    run_mcp()
     assert started == [(cert, key)]
 
 
@@ -91,11 +84,7 @@ def test_tls_name_passes_host_and_origin_checks() -> None:
     assert middleware._validate_origin(None) is True
 
 
-def test_run_mcp_http_rejects_a_bad_port(monkeypatch) -> None:
-    monkeypatch.setattr("mcp.server.MCPServer", _FakeServer)
-    try:
-        run_mcp(http=True, port=0)
-    except ValueError as exc:
-        assert "port" in str(exc)
-    else:
-        raise AssertionError("expected ValueError")
+def test_run_mcp_rejects_a_bad_port(monkeypatch) -> None:
+    _capture(monkeypatch)
+    with pytest.raises(ValueError, match="port"):
+        run_mcp(port=0)

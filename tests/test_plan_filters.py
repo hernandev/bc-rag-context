@@ -11,7 +11,7 @@ def _source(group: str, space: str) -> SourceFile:
         rel_path="docs/a.md",
         language="markdown",
         size=1,
-        config_group=group,
+        group=group,
         space=space,
     )
 

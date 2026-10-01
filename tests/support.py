@@ -1,7 +1,18 @@
-"""Small configs that satisfy the required spaces schema."""
+"""Small configs that satisfy the required spaces schema, and catalog entries for tests."""
 
+from pathlib import Path
+
+from bc_rag.catalog import ProjectEntry, find_project, register_project
 from bc_rag.config import ChunkConfig, ModelSpec, RagConfig, SourceGroup, SpaceConfig
-from bc_rag.defaults import DEFAULT_INCLUDE
+
+# TypeScript, Vue and Markdown: what most test projects hold.
+DEFAULT_INCLUDE = ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts", "**/*.vue", "**/*.md", "**/*.mdx"]
+
+
+def entry_for(root: Path, name: str | None = None) -> ProjectEntry:
+    """The registered project at `root`, registering it on first use."""
+    found = find_project(str(root.resolve()))
+    return found if found is not None else register_project(root, name)
 
 
 def space_config(groups: list[SourceGroup] | None = None, **kwargs) -> RagConfig:

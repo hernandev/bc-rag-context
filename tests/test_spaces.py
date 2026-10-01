@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from bc_rag.config import RagConfig, load_config
+from bc_rag.config import load_config
 from bc_rag.query import search_projects
 from bc_rag.voyage_api import split_token_spans
 

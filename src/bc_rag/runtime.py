@@ -1,22 +1,22 @@
-"""Shared CLI wiring: resolve root, open store, load embedder."""
+"""Shared wiring for one registered project: open the store, load the embedder, index."""
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from rich.console import Console
 
-from bc_rag.catalog import register_project, store_dir_for_root
-from bc_rag.config import RagConfig, SpaceConfig, load_config, with_jina_api
-from bc_rag.defaults import STORE_DIRNAME
+from bc_rag.catalog import ProjectEntry
+from bc_rag.config import RagConfig, SpaceConfig, load_config
 from bc_rag.embeddings import Embedder, Reranker
 from bc_rag.store import HybridStore
 
 
 @dataclass
 class Session:
-    root: Path
+    entry: ProjectEntry
     config: RagConfig
     config_path: Path | None
     store: HybridStore
@@ -25,41 +25,34 @@ class Session:
     console: Console
     space: str | None = None
 
+    @property
+    def root(self) -> Path:
+        return self.entry.root_path()
+
     def close(self) -> None:
         self.store.close()
 
 
-def resolve_root(root: Path | None) -> Path:
-    return (root or Path.cwd()).expanduser().resolve()
-
-
 def open_session(
-    root: Path,
+    entry: ProjectEntry,
     *,
     need_reranker: bool = False,
     write: bool = True,
     console: Console | None = None,
-    jina_api: bool | None = None,
     space: str | None = None,
+    config: RagConfig | None = None,
+    config_path: Path | None = None,
 ) -> Session:
+    """One space of one project. Pass `config` to reuse a config that is already loaded."""
     console = console or Console(stderr=True)
-    config, config_path = load_config(root)
-    if jina_api is not None:
-        config = with_jina_api(config, jina_api)
-    spec: SpaceConfig | None = None
+    root = entry.root_path()
+    if config is None:
+        config, config_path = load_config(root)
     name = space or config.default_space
     spec = config.space_named(name)
-    space = name
-    if write:
-        register_project(root)
-    legacy = root / STORE_DIRNAME
-    had_legacy = legacy.is_dir()
-    dest = store_dir_for_root(root)
-    if had_legacy and not legacy.is_dir():
-        console.print(f"migrated {legacy} -> {dest}")
     store = HybridStore(
         url=config.qdrant_http_url(),
-        collection=config.qdrant_collection(root, space),
+        collection=config.qdrant_collection(root, name),
         read_only=not write,
     )
     embedder = make_embedder(config, spec)
@@ -69,14 +62,14 @@ def open_session(
     if need_reranker and spec.retrieve.rerank and rerank_model:
         reranker = Reranker(rerank_model, jina_api=rerank_is_jina)
     return Session(
-        root=root,
+        entry=entry,
         config=config,
         config_path=config_path,
         store=store,
         embedder=embedder,
         reranker=reranker,
         console=console,
-        space=space,
+        space=name,
     )
 
 
@@ -99,26 +92,71 @@ def make_embedder(config: RagConfig, spec: SpaceConfig | None) -> Embedder:
 
 
 def open_space_sessions(
-    root: Path,
+    entry: ProjectEntry,
     *,
     need_reranker: bool = False,
     write: bool = True,
     console: Console | None = None,
-    jina_api: bool | None = None,
 ) -> list[Session]:
-    """One session per configured space. No spaces means one session, today's store."""
-    config, _path = load_config(root)
-    if jina_api is not None:
-        config = with_jina_api(config, jina_api)
-    names: list[str] = list(config.spaces)
+    """One session per configured space. The config is loaded once and shared."""
+    config, config_path = load_config(entry.root_path())
     return [
         open_session(
-            root,
+            entry,
             need_reranker=need_reranker,
             write=write,
             console=console,
-            jina_api=jina_api,
             space=name,
+            config=config,
+            config_path=config_path,
         )
-        for name in names
+        for name in config.spaces
     ]
+
+
+def index_project(
+    entry: ProjectEntry,
+    *,
+    force: bool = False,
+    only_paths: list[str] | None = None,
+    console: Console | None = None,
+    stop: threading.Event | None = None,
+):
+    """One index pass over every space of one project. Sessions open fresh, so edits apply.
+
+    `stop` ends the pass after the files in flight. Raises IndexBusyError when another
+    process is indexing this project.
+    """
+    from bc_rag.cache import cache_dir
+    from bc_rag.indexer import Indexer, index_spaces
+
+    console = console or Console(stderr=True)
+    root = entry.root_path()
+    sessions = open_space_sessions(entry, write=True, console=console)
+    try:
+        indexers = [
+            Indexer(
+                entry,
+                session.config,
+                session.embedder,
+                session.store,
+                console,
+                space=session.space,
+            )
+            for session in sessions
+        ]
+        first = sessions[0]
+        console.print(f"[dim]project[/dim] {entry.name}  {root}")
+        console.print(f"[dim]config[/dim] {first.config_path}")
+        console.print(f"[dim]cache[/dim] {cache_dir(first.config.project_dir(root))}")
+        for session in sessions:
+            spec = session.config.space_named(session.space or session.config.default_space)
+            console.print(
+                f"[dim]space[/dim] {session.space}  dense {spec.dense.provider} "
+                f"{spec.dense.model}  sparse {spec.sparse.model}"
+            )
+            console.print(f"[dim]store[/dim] {session.config.store_dir(root, session.space)}")
+        return index_spaces(indexers, force=force, only_paths=only_paths, stop=stop)
+    finally:
+        for session in sessions:
+            session.close()

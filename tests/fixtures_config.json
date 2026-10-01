@@ -1,0 +1,34 @@
+{
+  "defaultSpace": "prose",
+  "spaces": {
+    "prose": {
+      "dense": { "provider": "local", "model": "jinaai/jina-embeddings-v2-base-en" },
+      "sparse": { "provider": "local", "model": "Qdrant/bm25" },
+      "chunk": { "max_chars": 2400, "min_chars": 40 }
+    }
+  },
+  "groups": [
+    {
+      "name": "engine-docs",
+      "space": "prose",
+      "priority": 50,
+      "include": ["docs/engine/**/*.md"],
+      "facets": { "scope": "internal", "area": "engine" }
+    },
+    {
+      "name": "admin-docs",
+      "space": "prose",
+      "priority": 40,
+      "include": ["docs/admin/**/*.md"],
+      "facets": { "scope": "internal", "area": "admin" }
+    },
+    {
+      "name": "olo-spec",
+      "space": "prose",
+      "priority": 100,
+      "kind": "openapi",
+      "include": ["docs/providers/olo.json"],
+      "facets": { "scope": "external", "vendor": "olo", "provider": "olo" }
+    }
+  ]
+}

@@ -17,7 +17,10 @@ def _write_config(root: Path, command: str | list[str]) -> None:
                 ],
                 "spaces": {
                     "prose": {
-                        "dense": {"provider": "local", "model": "jinaai/jina-embeddings-v2-base-en"},
+                        "dense": {
+                            "provider": "local",
+                            "model": "jinaai/jina-embeddings-v2-base-en",
+                        },
                         "sparse": {"provider": "local", "model": "Qdrant/bm25"},
                         "rerank": {"provider": "jina", "model": "jina-reranker-v3.5"},
                         "chunk": {"max_chars": 2400, "min_chars": 40},
@@ -42,15 +45,36 @@ def test_top_level_tags_are_rejected(tmp_path: Path) -> None:
     file_data = json.loads((tmp_path / ".bc-rag.json").read_text())
     file_data["tags"] = ["scope:internal"]
     (tmp_path / ".bc-rag.json").write_text(json.dumps(file_data), encoding="utf-8")
-    with pytest.raises(ValueError, match="tags is not a top-level key"):
+    with pytest.raises(ValueError, match="tags is not a config key. Set facets on each group"):
         load_config(tmp_path)
+
+
+def test_groups_false_skips_a_failing_command(tmp_path: Path) -> None:
+    _write_config(tmp_path, ["/no/such/program"])
+    with pytest.raises(ValueError, match="groupsCommand could not start"):
+        load_config(tmp_path)
+    configuration, _path = load_config(tmp_path, groups=False)
+    assert configuration.is_partial()
+    assert [group.name for group in configuration.groups] == ["static-docs"]
+
+
+def test_a_partial_config_cannot_list_files(tmp_path: Path) -> None:
+    from bc_rag.discover import iter_source_files, source_for_path
+
+    _write_config(tmp_path, ["/no/such/program"])
+    configuration, _path = load_config(tmp_path, groups=False)
+    with pytest.raises(ValueError, match="without groupsCommand"):
+        list(iter_source_files(tmp_path, configuration))
+    with pytest.raises(ValueError, match="without groupsCommand"):
+        source_for_path("docs/a.md", tmp_path / "docs" / "a.md", configuration)
 
 
 def test_groups_command_appends_json_groups(tmp_path: Path) -> None:
     script = tmp_path / "groups.py"
     script.write_text(
         "#!/usr/bin/env python3\n"
-        "print('{\"groups\": [{\"name\": \"from-command\", \"include\": [\"libs/**/*.py\"], \"space\": \"code\"}]}')\n",
+        "print('{\"groups\": [{\"name\": \"from-command\", "
+        "\"include\": [\"libs/**/*.py\"], \"space\": \"code\"}]}')\n",
         encoding="utf-8",
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
@@ -65,39 +89,37 @@ def test_groups_command_rejects_a_repeated_name(tmp_path: Path) -> None:
     script = tmp_path / "groups.py"
     script.write_text(
         "#!/usr/bin/env python3\n"
-        "print('{\"groups\": [{\"name\": \"static-docs\", \"include\": [\"libs/**/*.py\"]}]}')\n",
+        "print('{\"groups\": [{\"name\": \"static-docs\", \"space\": \"prose\", "
+        "\"include\": [\"libs/**/*.py\"]}]}')\n",
         encoding="utf-8",
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     _write_config(tmp_path, "groups.py")
-    with pytest.raises(ValueError, match="static-docs"):
+    with pytest.raises(ValueError, match="repeated the group name 'static-docs'"):
         load_config(tmp_path)
 
 
-def test_config_command_prints_static_and_command_groups(tmp_path: Path) -> None:
+def test_sources_groups_lists_static_and_command_groups(tmp_path: Path) -> None:
     script = tmp_path / "groups.py"
     script.write_text(
         "#!/usr/bin/env python3\n"
-        "print('{\"groups\": [{\"name\": \"from-command\", \"include\": [\"libs/**/*.py\"], \"space\": \"code\"}]}')\n",
+        "print('{\"groups\": [{\"name\": \"from-command\", "
+        "\"include\": [\"libs/**/*.py\"], \"space\": \"code\"}]}')\n",
         encoding="utf-8",
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     _write_config(tmp_path, "groups.py")
     from typer.testing import CliRunner
 
+    from bc_rag.catalog import register_project
     from bc_rag.cli import app
 
-    result = CliRunner().invoke(app, ["config", "dump", "--root", str(tmp_path)])
-    assert result.exit_code == 0
+    register_project(tmp_path)
+    result = CliRunner().invoke(app, ["sources", "groups", "--root", str(tmp_path), "--json"])
+    assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    names = [group["name"] for group in payload["groups"]]
-    assert names == ["static-docs", "from-command"]
-    assert list(payload)[-1] == "groups"
-    assert payload["groupsCommand"] == "groups.py"
-    assert payload["defaultSpace"] == "prose"
-    assert "embed" not in payload
-    assert "chunk" not in payload
-    assert "openapi" not in payload
+    names = {group["name"] for group in payload["groups"]}
+    assert names == {"static-docs", "from-command"}
 
 
 def test_groups_command_rejects_stdout_that_is_not_groups(tmp_path: Path) -> None:

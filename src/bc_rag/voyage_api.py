@@ -16,7 +16,7 @@ from bc_rag.defaults import (
     VOYAGE_MAX_CHUNKS,
     VOYAGE_PRECHUNK_TOKENS,
 )
-from bc_rag.jina_api import RateLimiter, estimate_tokens
+from bc_rag.jina_api import RateLimiter, _retry_after_seconds, estimate_tokens
 
 # Tier-1 tokens per minute from the Voyage rate-limit table.
 _TPM = {
@@ -66,7 +66,7 @@ def resolve_api_key(explicit: str | None = None) -> str:
     ).strip()
     if not key:
         raise VoyageApiError(
-            "no Voyage key. Run `bc-rag config set voyage-api-key <key>` "
+            "no Voyage key. Run `bc-rag config set voyage-api-key <key> --global` "
             f"or set {VOYAGE_API_KEY_ENV}."
         )
     return key
@@ -269,16 +269,19 @@ def rerank_texts(
         "query": query,
         "documents": documents,
     }
+    repeated_query_tokens = estimate_tokens([query]) * (len(documents) - 1)
     body = _post_json(
         f"{base_url.rstrip('/')}/v1/rerank",
         payload,
         api_key=api_key,
         model=model,
-        tokens=estimate_tokens([query, *documents]) + estimate_tokens([query]) * (len(documents) - 1),
+        tokens=estimate_tokens([query, *documents]) + repeated_query_tokens,
     )
-    results = body.get("results")
+    # Voyage answers {"object": "list", "data": [{"index", "relevance_score"}], ...}.
+    # Jina and Cohere name the same list "results"; Voyage does not.
+    results = body.get("data")
     if not isinstance(results, list):
-        raise VoyageApiError("voyage rerank response is missing results")
+        raise VoyageApiError("voyage rerank response is missing data")
     scores = [0.0] * len(documents)
     for row in results:
         if not isinstance(row, dict):
@@ -353,13 +356,17 @@ def _contextual_pieces(body: dict[str, Any]) -> list[tuple[str, list[float]]]:
     nested = first.get("data")
     if not isinstance(nested, list):
         return []
-    ordered = sorted(nested, key=lambda item: int(item.get("index", 0)) if isinstance(item, dict) else 0)
+    ordered = sorted(
+        nested,
+        key=lambda item: int(item.get("index", 0)) if isinstance(item, dict) else 0,
+    )
     pieces: list[tuple[str, list[float]]] = []
     for item in ordered:
         if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
             continue
         text = item.get("text")
-        pieces.append((text if isinstance(text, str) else "", [float(value) for value in item["embedding"]]))
+        vector = [float(value) for value in item["embedding"]]
+        pieces.append((text if isinstance(text, str) else "", vector))
     return pieces
 
 
@@ -409,7 +416,7 @@ def _post_json(
             if retryable:
                 last_error = VoyageApiError(f"voyage {error.code}: {detail}")
                 if error.code == 429:
-                    limiter.note_429()
+                    limiter.note_429(_retry_after_seconds(error))
                     continue
                 time.sleep(min(2 ** attempt, 30))
                 continue

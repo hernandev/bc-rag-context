@@ -80,17 +80,26 @@ def list_known_models() -> dict[str, str]:
     return known
 
 
-def configured_model_names(root: Path) -> list[str]:
+def configured_model_names(root: Path, *, local_only: bool = False) -> list[str]:
+    """Model ids the project's spaces name. `local_only` keeps only FastEmbed models."""
     from bc_rag.config import load_config
 
-    configuration, _ = load_config(root)
+    configuration, _ = load_config(root, groups=False)
     names: list[str] = []
     for spec in configuration.spaces.values():
-        names.append(spec.dense_id())
-        names.append(spec.sparse.model)
-        if spec.rerank is not None:
-            names.append(spec.rerank.model)
+        for model in (spec.dense, spec.sparse, spec.rerank):
+            if model is None or (local_only and model.provider != "local"):
+                continue
+            if model.model not in names:
+                names.append(model.model)
     return names
+
+
+def is_api_model(model_name: str) -> bool:
+    """True for Voyage and Jina API ids, which FastEmbed cannot download."""
+    from bc_rag.voyage_api import is_voyage_model
+
+    return is_voyage_model(model_name) or model_name.startswith(("rerank-", "jina-"))
 
 
 def find_cached_path(model_name: str) -> Path | None:
@@ -111,9 +120,10 @@ def find_cached_path(model_name: str) -> Path | None:
     return None
 
 
-def list_models(root: Path) -> list[ModelRecord]:
+def list_models(root: Path | None) -> list[ModelRecord]:
+    """Cached models, plus the project's local models when `root` is given."""
     known = list_known_models()
-    configured = set(configured_model_names(root))
+    configured = set(configured_model_names(root, local_only=True)) if root is not None else set()
     names = list(configured)
     cache = cache_directory()
     if cache.is_dir():
@@ -143,6 +153,8 @@ def download_model(model_name: str) -> Path:
     from fastembed import SparseTextEmbedding, TextEmbedding
     from fastembed.rerank.cross_encoder import TextCrossEncoder
 
+    if is_api_model(model_name):
+        raise ValueError(f"{model_name} is an API model. It runs remotely and is never downloaded.")
     cache = str(cache_directory())
     kind = list_known_models().get(model_name)
     if kind == "sparse":
@@ -153,7 +165,9 @@ def download_model(model_name: str) -> Path:
         TextEmbedding(model_name=model_name, cache_dir=cache)
     found = find_cached_path(model_name)
     if found is None:
-        raise FileNotFoundError(f"downloaded {model_name} but cache folder was not found under {cache}")
+        raise FileNotFoundError(
+            f"downloaded {model_name} but cache folder was not found under {cache}"
+        )
     return found
 
 
