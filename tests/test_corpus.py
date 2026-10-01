@@ -1,7 +1,8 @@
 import json
 from pathlib import Path
 
-from bc_rag.config import RagConfig, SourceGroup
+from bc_rag.config import SourceGroup
+from tests.support import space_config
 from bc_rag.corpus import (
     attributes_from_source,
     bundle_sources,
@@ -60,31 +61,29 @@ def test_bundle_prunes_disabled_group(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "keep.md").write_text("# keep\n", encoding="utf-8")
     (tmp_path / "docs" / "drop.md").write_text("# drop\n", encoding="utf-8")
-    keep_group = SourceGroup(
+    keep_group = SourceGroup(space="prose", 
         name="keep",
         include=["docs/keep.md"],
         tags=["scope:internal"],
         enabled=True,
     )
-    drop_group = SourceGroup(
+    drop_group = SourceGroup(space="prose", 
         name="drop",
         include=["docs/drop.md"],
         tags=["scope:internal"],
         enabled=True,
     )
-    first = RagConfig(
+    first = space_config(
         follow_gitignore=False,
         groups=[keep_group, drop_group],
-        openapi={"enabled": False, "include": []},
     )
     bundle_sources(tmp_path, first)
     names = {path.name for path in corpus_dir(first.project_dir(tmp_path)).rglob("*.md")}
     assert "keep.md" in names
     assert "drop.md" in names
-    second = RagConfig(
+    second = space_config(
         follow_gitignore=False,
         groups=[keep_group, drop_group.model_copy(update={"enabled": False})],
-        openapi={"enabled": False, "include": []},
     )
     _written, pruned = bundle_sources(tmp_path, second)
     names = {path.name for path in corpus_dir(second.project_dir(tmp_path)).rglob("*.md")}
@@ -97,10 +96,10 @@ def test_tag_change_rewrites_sidecar_and_reindexes(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr("bc_rag.indexer.register_project", lambda root: None)
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "Location.ts").write_text(TS, encoding="utf-8")
-    first = RagConfig(
+    first = space_config(
         follow_gitignore=False,
         groups=[
-            SourceGroup(
+            SourceGroup(space="prose", 
                 name="src",
                 include=["src/**/*.ts"],
                 tags=["scope:internal", "area:engine"],
@@ -123,10 +122,10 @@ def test_tag_change_rewrites_sidecar_and_reindexes(tmp_path: Path, monkeypatch) 
         assert same.skipped_unchanged == 1
         assert embedder.calls == after_first
 
-        second = RagConfig(
+        second = space_config(
             follow_gitignore=False,
             groups=[
-                SourceGroup(
+                SourceGroup(space="prose", 
                     name="src",
                     include=["src/**/*.ts"],
                     tags=["scope:internal", "area:engine", "layer:engine-core"],

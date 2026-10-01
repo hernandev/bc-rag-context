@@ -13,6 +13,12 @@ QDRANT_GRPC_PORT = 32322
 MCP_HTTP_HOST = "127.0.0.1"
 MCP_HTTP_PORT = 32323
 MCP_HTTP_PATH = "/mcp"
+# HTTPS beside that listener. Claude's remote MCP form refuses a plain http URL.
+# The certificate is issued for this name and stored under ~/.bc-rag/.
+MCP_HTTPS_PORT = 32324
+MCP_TLS_HOST = "bc-rag.localhost"
+MCP_TLS_CERT_FILENAME = "mcp.pem"
+MCP_TLS_KEY_FILENAME = "mcp.key"
 QDRANT_DOCKER_CONTEXT = "orbstack"
 QDRANT_COMPOSE_PROJECT = "bc-rag"
 QDRANT_IMAGE = "qdrant/qdrant:v1.19.1"
@@ -91,6 +97,18 @@ DEFAULT_SPARSE_MODEL = "Qdrant/bm25"
 DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v1-turbo-en"
 JINA_API_URL = "https://api.jina.ai"
 JINA_API_KEY_ENV = "JINA_API_KEY"
+VOYAGE_API_URL = "https://api.voyageai.com"
+VOYAGE_API_KEY_ENV = "VOYAGE_AI_API_KEY"
+# voyage-context-4 refuses a document over 32_000 tokens and will not truncate.
+# chars/4 under-counts markdown, so the packer stays under 20_000 tokens at 2 chars each.
+VOYAGE_PRECHUNK_TOKENS = 20_000
+VOYAGE_CONTEXT_CHARS_PER_TOKEN = 2
+VOYAGE_AUTO_TOKENS = 120_000
+VOYAGE_MAX_CHUNKS = 16_000
+# Flat models such as voyage-code-4. Several short files share one POST.
+# 120k tokens is the tight batch ceiling on the embeddings page. 4 chars per token.
+VOYAGE_FLAT_MAX_TEXTS = 256
+VOYAGE_FLAT_MAX_CHARS = 120_000 * 4
 JINA_RPM = 500
 JINA_TPM = 2_000_000
 JINA_HTTP_WORKERS = 8
@@ -110,7 +128,6 @@ EMBED_HTTP_MAX_CHARS = 40_000
 EMBED_HTTP_MAX_TEXTS = 64
 
 DEFAULT_CHUNK_MAX_CHARS = 2400
-DEFAULT_OPENAPI_MAX_CHARS = 16000
 DEFAULT_CHUNK_MIN_CHARS = 40
 DEFAULT_PREFETCH = 80
 DEFAULT_LIMIT = 10

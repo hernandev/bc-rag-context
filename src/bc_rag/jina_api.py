@@ -190,10 +190,16 @@ def api_model_name(model: str) -> str:
 
 
 def resolve_api_key(explicit: str | None = None) -> str:
-    key = (explicit or os.environ.get(JINA_API_KEY_ENV) or "").strip()
+    """The explicit key, else `~/.bc-rag/config`, else the environment."""
+    from bc_rag.usersettings import config_setting
+
+    key = (
+        explicit or config_setting("jina-api-key") or os.environ.get(JINA_API_KEY_ENV) or ""
+    ).strip()
     if not key:
         raise JinaApiError(
-            f"{JINA_API_KEY_ENV} is not set. Get a key at https://jina.ai/api-dashboard/key-manager"
+            f"no Jina key. Run `bc-rag config set jina-api-key <key>` or set {JINA_API_KEY_ENV}. "
+            "Get a key at https://jina.ai/api-dashboard/key-manager"
         )
     return key
 

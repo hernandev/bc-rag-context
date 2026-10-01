@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from bc_rag.config import RagConfig, SourceGroup, load_config
+from bc_rag.config import ChunkConfig, ModelSpec, SourceGroup, SpaceConfig, load_config
+from tests.support import space_config
 from bc_rag.discover import debug_resolve_groups, iter_source_files
 
 
@@ -9,17 +10,16 @@ def test_disabled_groups_are_not_indexed(tmp_path: Path) -> None:
     (tmp_path / "libs" / "api" / "pkg" / "src" / "a.ts").write_text("export const a = 1;\n", encoding="utf-8")
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "a.md").write_text("# a\n", encoding="utf-8")
-    configuration = RagConfig(
+    configuration = space_config(
         groups=[
-            SourceGroup(name="docs-bigcolony-reference", include=["docs/**/*.md"], priority=80),
-            SourceGroup(
+            SourceGroup(space="prose", name="docs-bigcolony-reference", include=["docs/**/*.md"], priority=80),
+            SourceGroup(space="prose", 
                 name="libs-api-pkg",
                 include=["libs/api/**/src/**/*.ts"],
                 priority=55,
                 enabled=False,
             ),
         ],
-        openapi={"enabled": False, "include": []},
     )
     files = list(iter_source_files(tmp_path, configuration))
     assert [source.rel_path for source in files] == ["docs/a.md"]
@@ -33,31 +33,45 @@ def test_disabled_groups_are_not_indexed(tmp_path: Path) -> None:
 def test_group_chunk_override_is_attached_to_source_files(tmp_path: Path) -> None:
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "a.md").write_text("# a\n" + ("x" * 100), encoding="utf-8")
-    configuration = RagConfig(
+    configuration = space_config(
+        spaces={
+            "prose": SpaceConfig(
+                dense=ModelSpec(provider="local", model="jinaai/jina-embeddings-v2-base-en"),
+                sparse=ModelSpec(provider="local", model="Qdrant/bm25"),
+                rerank=ModelSpec(provider="jina", model="jina-reranker-v3.5"),
+                chunk=ChunkConfig(max_chars=400, min_chars=1),
+            )
+        },
         groups=[
-            SourceGroup(
+            SourceGroup(space="prose", 
                 name="docs-bigcolony-reference",
                 include=["docs/**/*.md"],
                 priority=80,
-                chunk={"max_chars": 400, "min_chars": 1},
             )
         ],
-        openapi={"enabled": False, "include": []},
     )
     files = list(iter_source_files(tmp_path, configuration))
     assert files[0].chunk is not None
     assert files[0].chunk.max_chars == 400
     assert files[0].chunk.min_chars == 1
-    assert files[0].chunk.openapi_max_chars == configuration.chunk.openapi_max_chars
 
 
 def test_groups_load_from_json(tmp_path: Path) -> None:
     (tmp_path / ".bc-rag.json").write_text(
         """
 {
+  "defaultSpace": "prose",
+  "spaces": {
+    "prose": {
+      "dense": {"provider": "local", "model": "jinaai/jina-embeddings-v2-base-en"},
+      "sparse": {"provider": "local", "model": "Qdrant/bm25"},
+      "rerank": {"provider": "jina", "model": "jina-reranker-v3.5"},
+      "chunk": {"max_chars": 2400, "min_chars": 40}
+    }
+  },
   "groups": [
-    {"name": "source", "include": ["libs/**/src/**/*.ts"], "priority": 10},
-    {"name": "reference", "include": ["docs/**/*.md"], "priority": 80}
+    {"name": "source", "space": "prose", "include": ["libs/**/src/**/*.ts"], "priority": 10},
+    {"name": "reference", "space": "prose", "include": ["docs/**/*.md"], "priority": 80}
   ]
 }
 """,
@@ -79,9 +93,9 @@ def test_openapi_group_stamps_shared_and_vendor_tags(tmp_path: Path) -> None:
         '{"openapi":"3.0.3","info":{"title":"k","version":"1"},"paths":{}}\n',
         encoding="utf-8",
     )
-    configuration = RagConfig(
+    configuration = space_config(
         groups=[
-            SourceGroup(
+            SourceGroup(space="prose", 
                 name="docs-providers-_openapi-olo",
                 kind="openapi",
                 tags=[
@@ -94,7 +108,7 @@ def test_openapi_group_stamps_shared_and_vendor_tags(tmp_path: Path) -> None:
                 include=["docs/providers/_openapi/olo--*.json"],
                 priority=100,
             ),
-            SourceGroup(
+            SourceGroup(space="prose", 
                 name="docs-providers-_openapi-klaviyo",
                 kind="openapi",
                 tags=[
@@ -108,7 +122,6 @@ def test_openapi_group_stamps_shared_and_vendor_tags(tmp_path: Path) -> None:
                 priority=100,
             ),
         ],
-        openapi={"enabled": False, "include": []},
     )
     files = list(iter_source_files(tmp_path, configuration))
     by_name = {source.path.name: source.tags for source in files}
@@ -127,33 +140,31 @@ def test_ingest_order_follows_priority_not_list_order(tmp_path: Path) -> None:
     (tmp_path / "docs" / "a.md").write_text("# a\n", encoding="utf-8")
     (tmp_path / "libs" / "pkg" / "src").mkdir(parents=True)
     (tmp_path / "libs" / "pkg" / "src" / "a.ts").write_text("export const a = 1;\n", encoding="utf-8")
-    configuration = RagConfig(
+    configuration = space_config(
         groups=[
-            SourceGroup(name="source", include=["libs/**/src/**/*.ts"], priority=10),
-            SourceGroup(name="reference", include=["docs/**/*.md"], priority=80),
+            SourceGroup(space="prose", name="source", include=["libs/**/src/**/*.ts"], priority=10),
+            SourceGroup(space="prose", name="reference", include=["docs/**/*.md"], priority=80),
         ],
-        openapi={"enabled": False, "include": []},
     )
     files = list(iter_source_files(tmp_path, configuration))
     assert [source.group for source in files] == ["reference", "source"]
     assert files[0].priority == 80
     assert files[0].group == "reference"
-    assert files[0].tags == []
+    assert files[0].tags == ["group:reference"]
 
 
 def test_disk_include_does_not_care_about_gitignore(tmp_path: Path) -> None:
     (tmp_path / "secret").mkdir()
     (tmp_path / "secret" / "notes.md").write_text("# secret\n", encoding="utf-8")
     (tmp_path / ".gitignore").write_text("secret/\n", encoding="utf-8")
-    configuration = RagConfig(
+    configuration = space_config(
         groups=[
-            SourceGroup(
+            SourceGroup(space="prose", 
                 name="ignored-notes",
                 include=["secret/**/*.md"],
                 priority=1,
             )
         ],
-        openapi={"enabled": False, "include": []},
     )
     files = list(iter_source_files(tmp_path, configuration))
     assert [source.rel_path for source in files] == ["secret/notes.md"]

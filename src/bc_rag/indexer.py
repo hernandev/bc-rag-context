@@ -31,6 +31,8 @@ from bc_rag.defaults import (
     DEFAULT_MAX_FILE_BYTES,
     EMBED_HTTP_MAX_CHARS,
     EMBED_HTTP_MAX_TEXTS,
+    VOYAGE_FLAT_MAX_CHARS,
+    VOYAGE_FLAT_MAX_TEXTS,
     JINA_FILE_WORKERS,
     JINA_HTTP_WORKERS,
     JINA_UPSERT_WORKERS,
@@ -113,6 +115,16 @@ class _QueueStage:
                 self._emit_depth()
 
 
+def flat_http_limits(embedder: object) -> tuple[int, int]:
+    """Code and other flat models pack many short files into one POST.
+
+    Contextual models stay one document per inner list, packed separately.
+    """
+    if getattr(embedder, "voyage_api", False) and not getattr(embedder, "contextual", False):
+        return VOYAGE_FLAT_MAX_CHARS, VOYAGE_FLAT_MAX_TEXTS
+    return EMBED_HTTP_MAX_CHARS, EMBED_HTTP_MAX_TEXTS
+
+
 def take_http_batch(
     chunks: list[Chunk],
     *,
@@ -177,6 +189,7 @@ class Indexer:
         embedder: Embedder,
         store: HybridStore,
         console: Console | None = None,
+        space: str | None = None,
     ) -> None:
         # keep the project root so relative paths stay stable across runs.
         self.root = root
@@ -186,12 +199,46 @@ class Indexer:
         self.embedder = embedder
         # keep the Qdrant store that holds one point per chunk.
         self.store = store
+        # None keeps today's single collection. A name indexes only that space.
+        self.space = space or configuration.default_space
         # write progress on stderr so MCP stdio on stdout stays clean.
         self.console = console or Console(stderr=True)
 
-    def run(self, *, force: bool = False, only_paths: list[str] | None = None) -> IndexStats:
+    def collect_groups(
+        self, only_paths: list[str] | None
+    ) -> list[tuple[str, list[SourceFile]]]:
+        """Files for this space. Called once up front so the panel total spans every space."""
+        if only_paths is not None:
+            grouped: list[tuple[str, list[SourceFile]]] = [
+                ("watch", sources_for_paths(self.root, self.configuration, set(only_paths)))
+            ]
+        else:
+            grouped = [
+                (group.name, files)
+                for group, files in iter_source_groups(self.root, self.configuration)
+            ]
+        grouped = [
+            (name, materialize_openapi_sources(self.root, self.configuration, files))
+            for name, files in grouped
+        ]
+        if self.space is not None:
+            grouped = [
+                (name, [item for item in files if item.space == self.space])
+                for name, files in grouped
+            ]
+            grouped = [(name, files) for name, files in grouped if files]
+        return grouped
+
+    def run(
+        self,
+        *,
+        force: bool = False,
+        only_paths: list[str] | None = None,
+        log: IndexLog | None = None,
+        grouped: list[tuple[str, list[SourceFile]]] | None = None,
+    ) -> IndexStats:
         # load the previous file hashes so unchanged files can be skipped.
-        manifest_path = self.configuration.manifest_path(self.root)
+        manifest_path = self.configuration.manifest_path(self.root, self.space)
         previous = load_manifest(manifest_path)
         # a model swap invalidates every stored vector, so the whole collection is rebuilt.
         models_changed = (
@@ -237,43 +284,44 @@ class Indexer:
 
         previous_sigint = signal.signal(signal.SIGINT, on_sigint)
 
-        if only_paths is not None:
-            wanted = set(only_paths)
-            grouped: list[tuple[str, list[SourceFile]]] = [
-                ("watch", sources_for_paths(self.root, self.configuration, wanted))
-            ]
-        else:
-            wanted = None
-            grouped = [
-                (group.name, files)
-                for group, files in iter_source_groups(self.root, self.configuration)
-            ]
-        grouped = [
-            (name, materialize_openapi_sources(self.root, self.configuration, files))
-            for name, files in grouped
-        ]
+        own_log = log is None
+        wanted = set(only_paths) if only_paths is not None else None
+        if grouped is None:
+            grouped = self.collect_groups(only_paths)
 
         catalog_entry = register_project(self.root)
         catalog_name = getattr(catalog_entry, "name", None) or self.root.name
-        store_dir = self.configuration.store_dir(self.root)
-        log = IndexLog(
-            store_dir,
-            self.console,
-            catalog_name=catalog_name,
-            root=self.root,
-        )
+        store_dir = self.configuration.store_dir(self.root, self.space)
+        if own_log:
+            log = IndexLog(
+                store_dir,
+                self.console,
+                catalog_name=catalog_name,
+                root=self.root,
+            )
+        assert log is not None
+        log.set_embed_label(_embed_label(self.embedder))
         run_files_total = sum(len(files) for _, files in grouped)
         run_bytes_total = sum(item.size for _, files in grouped for item in files)
-        log.set_totals(files=run_files_total, nbytes=run_bytes_total)
-        log.start()
-        log.event(
-            "begin",
-            store=str(store_dir),
-            corpus=str(corpus_dir(self.configuration.project_dir(self.root))),
-            threads=os.cpu_count() or 4,
-            files_total=run_files_total,
-            bytes_total=run_bytes_total,
-        )
+        if own_log:
+            log.set_totals(files=run_files_total, nbytes=run_bytes_total)
+            log.start()
+            log.event(
+                "begin",
+                store=str(store_dir),
+                corpus=str(corpus_dir(self.configuration.project_dir(self.root))),
+                threads=os.cpu_count() or 4,
+                files_total=run_files_total,
+                bytes_total=run_bytes_total,
+            )
+        else:
+            log.event(
+                "space",
+                space=self.space or self.configuration.default_space,
+                phase="start",
+                files=run_files_total,
+                bytes=run_bytes_total,
+            )
         run_files_done = 0
         run_bytes_done = 0
         store_lock = threading.Lock()
@@ -289,13 +337,14 @@ class Indexer:
             last_manifest_save = now
 
         jina = getattr(self.embedder, "jina_api", False)
+        voyage = getattr(self.embedder, "voyage_api", False)
         file_count = sum(len(files) for _name, files in grouped)
         small_job = only_paths is not None or file_count <= 8
         if small_job:
             chunk_workers = min(2, max(1, file_count))
             post_workers = min(2, max(1, file_count))
             upsert_workers = 1
-        elif jina:
+        elif jina or voyage:
             chunk_workers = JINA_FILE_WORKERS
             post_workers = JINA_HTTP_WORKERS
             upsert_workers = JINA_UPSERT_WORKERS
@@ -315,7 +364,43 @@ class Indexer:
             log.event("post", texts=len(dense_texts), chars=chars)
             started = time.perf_counter()
             try:
+                if (
+                    getattr(self.embedder, "contextual", False)
+                    and getattr(self.embedder, "contextual_input", "chunks") == "auto"
+                ):
+                    return embed_auto_document(batch)
                 dense, sparse = self.embedder.embed_docs(dense_texts, sparse_texts)
+            except Exception as error:
+                message = str(error).lower()
+                if "too many tokens" not in message:
+                    raise
+                # Voyage counted more tokens than chars/2. Cut the batch and retry.
+                if len(batch) > 1:
+                    mid = max(1, len(batch) // 2)
+                    left = embed_batch(batch[:mid])
+                    right = embed_batch(batch[mid:])
+                    return EmbeddedBatch(
+                        chunks=left.chunks + right.chunks,
+                        dense=left.dense + right.dense,
+                        sparse=left.sparse + right.sparse,
+                        dense_texts=left.dense_texts + right.dense_texts,
+                        embed_ms=left.embed_ms + right.embed_ms,
+                    )
+                smaller = _shrink_context_batch(batch)
+                if len(smaller) < 2:
+                    raise error
+                extra = Counter(chunk.path for chunk in smaller)
+                base = Counter(chunk.path for chunk in batch)
+                with store_lock:
+                    for path, count in extra.items():
+                        delta = count - base.get(path, 0)
+                        if delta <= 0:
+                            continue
+                        remaining_chunks[path] = remaining_chunks.get(path, 0) + delta
+                        record = queued_records.get(path)
+                        if record is not None:
+                            record.chunks += delta
+                return embed_batch(smaller)
             finally:
                 embed_ms = (time.perf_counter() - started) * 1000
                 log.stage_leave("post", ms=embed_ms)
@@ -325,6 +410,62 @@ class Indexer:
                 sparse=sparse,
                 dense_texts=dense_texts,
                 embed_ms=embed_ms,
+            )
+
+        def embed_auto_document(batch: list[Chunk]) -> EmbeddedBatch:
+            from bc_rag.chunking import Chunk
+            from bc_rag.voyage_api import embed_contextual_auto
+
+            path = batch[0].path
+            text = (self.root / path).read_text(encoding="utf-8")
+            pieces, _tokens = embed_contextual_auto(
+                model=self.embedder.dense_model,
+                document=text,
+                dimensions=getattr(self.embedder, "dimensions", None),
+            )
+            built: list[Chunk] = []
+            cursor = 0
+            for piece, _vector in pieces:
+                found = text.find(piece, cursor) if piece else -1
+                if found < 0 and piece:
+                    found = text.find(piece)
+                start_byte = found if found >= 0 else 0
+                end_byte = start_byte + len(piece) if found >= 0 else 0
+                start_line = text.count("\n", 0, start_byte) + 1 if found >= 0 else 0
+                end_line = text.count("\n", 0, end_byte) + 1 if found >= 0 else 0
+                built.append(
+                    Chunk(
+                        path=path,
+                        language=batch[0].language,
+                        kind="auto",
+                        symbol=None,
+                        heading_path=None,
+                        start_line=start_line,
+                        end_line=end_line,
+                        start_byte=start_byte,
+                        end_byte=end_byte,
+                        text=piece,
+                        tags=list(batch[0].tags),
+                        metadata=dict(batch[0].metadata),
+                        group=batch[0].group,
+                        priority=batch[0].priority,
+                    )
+                )
+                if found >= 0:
+                    cursor = end_byte
+            with store_lock:
+                remaining_chunks[path] = remaining_chunks.get(path, 0) - len(batch) + len(built)
+                record = queued_records.get(path)
+                if record is not None:
+                    record.chunks = len(built)
+            dense = [vector for _piece, vector in pieces]
+            sparse = self.embedder.embed_sparse_texts([chunk.sparse_text() for chunk in built])
+            return EmbeddedBatch(
+                chunks=built,
+                dense=dense,
+                sparse=sparse,
+                dense_texts=[chunk.embed_text() for chunk in built],
+                embed_ms=0.0,
             )
 
         def upsert_batch(embedded: EmbeddedBatch) -> None:
@@ -425,13 +566,24 @@ class Indexer:
                     stats.errors.append(f"{source_file.rel_path}: not utf-8")
                 log.event("error", path=source_file.rel_path, group=bucket, message="not utf-8")
                 return []
-            if (
-                source_file.embed is not None
-                and source_file.embed.dense != self.embedder.dense_model
-            ):
+            explicit = getattr(source_file, "explicit_dense", None)
+            if self.space is None:
+                mismatched = (
+                    source_file.embed.dense
+                    if source_file.embed is not None
+                    and source_file.embed.dense != self.embedder.dense_model
+                    else None
+                )
+            else:
+                mismatched = (
+                    explicit
+                    if explicit and explicit != self.embedder.dense_model
+                    else None
+                )
+            if mismatched is not None:
                 message = (
                     f"{source_file.rel_path}: group embed.dense "
-                    f"{source_file.embed.dense!r} does not match collection model "
+                    f"{mismatched!r} does not match collection model "
                     f"{self.embedder.dense_model!r}. One Qdrant collection is one dense space."
                 )
                 with state_lock:
@@ -457,7 +609,10 @@ class Indexer:
             for chunk in chunks:
                 chunk.tags = list(source_file.tags)
                 chunk.metadata = dict(source_file.metadata)
-                chunk.group = source_file.group
+                chunk.group = source_file.config_group or source_file.group
+                group_tag = f"group:{chunk.group}"
+                if chunk.group and group_tag not in chunk.tags:
+                    chunk.tags.append(group_tag)
                 chunk.priority = source_file.priority
                 from bc_rag.facets import parse_tag_clause
 
@@ -539,24 +694,26 @@ class Indexer:
         pack_lock = threading.Lock()
         pack_buffer: list[Chunk] = []
 
+        max_chars, max_texts = flat_http_limits(self.embedder)
+
         def pack_ready(buffer: list[Chunk]) -> bool:
             if not buffer:
                 return False
             first = len(buffer[0].embed_text())
-            if first >= EMBED_HTTP_MAX_CHARS:
+            if first >= max_chars:
                 return True
-            if len(buffer) >= EMBED_HTTP_MAX_TEXTS:
+            if len(buffer) >= max_texts:
                 return True
             total = 0
-            for chunk in buffer[:EMBED_HTTP_MAX_TEXTS]:
+            for chunk in buffer[:max_texts]:
                 total += len(chunk.embed_text())
-                if total >= EMBED_HTTP_MAX_CHARS:
+                if total >= max_chars:
                     return True
             return False
 
         def emit_packed(*, force: bool = False) -> None:
             while pack_buffer and (force or pack_ready(pack_buffer)):
-                batch = take_http_batch(pack_buffer)
+                batch = take_http_batch(pack_buffer, max_chars=max_chars, max_texts=max_texts)
                 if not batch:
                     return
                 del pack_buffer[: len(batch)]
@@ -566,6 +723,20 @@ class Indexer:
         def on_file(job: FileJob) -> None:
             chunks = chunk_job(job)
             if not chunks:
+                return
+            if getattr(self.embedder, "contextual", False):
+                # Context models do not share a request across files.
+                # "chunks" sends our chunks. "auto" sends the file in embed_batch.
+                # Every other model keeps the cross-file packer below.
+                with pack_lock:
+                    batches = (
+                        [chunks]
+                        if getattr(self.embedder, "contextual_input", "chunks") == "auto"
+                        else _pack_one_document(chunks)
+                    )
+                    for batch in batches:
+                        log.add_work(batches=1, points=len(batch))
+                        post_stage.put(batch)
                 return
             with pack_lock:
                 pack_buffer.extend(chunks)
@@ -672,18 +843,31 @@ class Indexer:
             persist_manifest(force=True)
             stats.jina_embed_tokens = int(getattr(self.embedder, "jina_embed_tokens", 0) or 0)
             stats.jina_embed_calls = int(getattr(self.embedder, "jina_embed_calls", 0) or 0)
-            log.event(
-                "stopped" if stats.stopped else "done",
-                scanned=stats.scanned,
-                indexed=stats.indexed_files,
-                unchanged=stats.skipped_unchanged,
-                deleted=stats.deleted_files,
-                chunks=stats.chunks,
-                errors=len(stats.errors),
-                jina_embed_tokens=stats.jina_embed_tokens or None,
-                jina_embed_calls=stats.jina_embed_calls or None,
-                log=str(log.path),
-            )
+            if own_log:
+                log.event(
+                    "stopped" if stats.stopped else "done",
+                    scanned=stats.scanned,
+                    indexed=stats.indexed_files,
+                    unchanged=stats.skipped_unchanged,
+                    deleted=stats.deleted_files,
+                    chunks=stats.chunks,
+                    errors=len(stats.errors),
+                    jina_embed_tokens=stats.jina_embed_tokens or None,
+                    jina_embed_calls=stats.jina_embed_calls or None,
+                    log=str(log.path),
+                )
+            else:
+                log.event(
+                    "space",
+                    space=self.space or self.configuration.default_space,
+                    phase="end",
+                    scanned=stats.scanned,
+                    indexed=stats.indexed_files,
+                    unchanged=stats.skipped_unchanged,
+                    deleted=stats.deleted_files,
+                    chunks=stats.chunks,
+                    errors=len(stats.errors),
+                )
         finally:
             with store_lock:
                 for path in list(remaining_chunks):
@@ -695,9 +879,156 @@ class Indexer:
             except Exception:
                 pass
             signal.signal(signal.SIGINT, previous_sigint)
-            log.close()
+            if own_log:
+                log.close()
 
         return stats
+
+
+def _embed_label(embedder: object) -> str:
+    if getattr(embedder, "voyage_api", False):
+        return "voyage"
+    if getattr(embedder, "jina_api", False):
+        return "jina"
+    return ""
+
+
+def index_spaces(
+    indexers: list[Indexer],
+    *,
+    force: bool = False,
+    only_paths: list[str] | None = None,
+) -> IndexStats:
+    """Index every space under one panel. Totals are the sum, then each space runs."""
+    if not indexers:
+        return IndexStats()
+    prepared = [(indexer, indexer.collect_groups(only_paths)) for indexer in indexers]
+    first = indexers[0]
+    catalog_entry = register_project(first.root)
+    catalog_name = getattr(catalog_entry, "name", None) or first.root.name
+    log = IndexLog(
+        first.configuration.project_dir(first.root),
+        first.console,
+        catalog_name=catalog_name,
+        root=first.root,
+    )
+    files_total = sum(len(files) for _indexer, grouped in prepared for _name, files in grouped)
+    bytes_total = sum(
+        item.size for _indexer, grouped in prepared for _name, files in grouped for item in files
+    )
+    log.set_totals(files=files_total, nbytes=bytes_total)
+    log.start()
+    stats = IndexStats()
+    try:
+        for indexer, grouped in prepared:
+            if stats.stopped:
+                break
+            log.set_space(indexer.space or indexer.configuration.default_space)
+            part = indexer.run(
+                force=force,
+                only_paths=only_paths,
+                log=log,
+                grouped=grouped,
+            )
+            stats.scanned += part.scanned
+            stats.skipped_unchanged += part.skipped_unchanged
+            stats.skipped_large += part.skipped_large
+            stats.indexed_files += part.indexed_files
+            stats.deleted_files += part.deleted_files
+            stats.chunks += part.chunks
+            stats.jina_embed_tokens += part.jina_embed_tokens
+            stats.jina_embed_calls += part.jina_embed_calls
+            stats.stopped = stats.stopped or part.stopped
+            stats.errors.extend(part.errors)
+        log.event(
+            "stopped" if stats.stopped else "done",
+            scanned=stats.scanned,
+            indexed=stats.indexed_files,
+            unchanged=stats.skipped_unchanged,
+            deleted=stats.deleted_files,
+            chunks=stats.chunks,
+            errors=len(stats.errors),
+            log=str(log.path),
+        )
+    finally:
+        log.close()
+    return stats
+
+
+def _context_char_budget() -> int:
+    from bc_rag.defaults import VOYAGE_CONTEXT_CHARS_PER_TOKEN, VOYAGE_PRECHUNK_TOKENS
+
+    return VOYAGE_PRECHUNK_TOKENS * VOYAGE_CONTEXT_CHARS_PER_TOKEN
+
+
+def _shrink_context_batch(chunks: list[Chunk]) -> list[Chunk]:
+    """Split one over-budget document. A batch of several chunks is halved by the caller."""
+    fitted = _split_chunks_for_context(chunks)
+    if len(fitted) >= 2 or len(chunks) != 1:
+        return fitted
+    return _halve_chunk(chunks[0])
+
+
+def _halve_chunk(chunk: Chunk) -> list[Chunk]:
+    """Cut one chunk's text in half when the char budget still overshoots the tokenizer."""
+    from dataclasses import replace
+
+    text = chunk.text
+    if len(text) < 2:
+        return [chunk]
+    mid = len(text) // 2
+    left = text[:mid]
+    right = text[mid:]
+    left_lines = left.count("\n")
+    right_start = chunk.start_line + left_lines
+    return [
+        replace(chunk, text=left, end_line=max(chunk.start_line, right_start)),
+        replace(
+            chunk,
+            text=right,
+            start_line=right_start,
+            end_line=max(right_start, right_start + right.count("\n")),
+        ),
+    ]
+
+
+def _split_chunks_for_context(chunks: list[Chunk]) -> list[Chunk]:
+    """Cut a chunk whose embed text cannot fit in the voyage-context window."""
+    from dataclasses import replace
+
+    budget = _context_char_budget()
+    fitted: list[Chunk] = []
+    for chunk in chunks:
+        if len(chunk.embed_text()) <= budget:
+            fitted.append(chunk)
+            continue
+        overhead = len(chunk.embed_text()) - len(chunk.text)
+        body_budget = max(1_000, budget - max(0, overhead))
+        start = 0
+        text = chunk.text
+        while start < len(text):
+            piece = text[start : start + body_budget]
+            end = start + len(piece)
+            start_line = chunk.start_line + text[:start].count("\n")
+            end_line = chunk.start_line + text[:end].count("\n")
+            fitted.append(replace(chunk, text=piece, start_line=start_line, end_line=max(start_line, end_line)))
+            start = end
+    return fitted
+
+
+def _pack_one_document(chunks: list[Chunk]) -> list[list[Chunk]]:
+    """Keep one file's chunks together. Split only when the request ceiling says so."""
+    from bc_rag.defaults import VOYAGE_CONTEXT_CHARS_PER_TOKEN, VOYAGE_MAX_CHUNKS, VOYAGE_PRECHUNK_TOKENS
+    from bc_rag.voyage_api import split_token_spans
+
+    fitted = _split_chunks_for_context(chunks)
+    sizes = [
+        max(1, len(chunk.embed_text()) // VOYAGE_CONTEXT_CHARS_PER_TOKEN) for chunk in fitted
+    ]
+    spans = split_token_spans(
+        sizes, max_tokens=VOYAGE_PRECHUNK_TOKENS, max_items=VOYAGE_MAX_CHUNKS
+    )
+    return [fitted[start:end] for start, end in spans]
 
 
 def chunks_for(
@@ -709,7 +1040,7 @@ def chunks_for(
             root=root,
             source=source_file,
             text=text,
-            max_chars=chunk.openapi_max_chars,
+            max_chars=chunk.max_chars,
             min_chars=chunk.min_chars,
         )
 
@@ -728,13 +1059,18 @@ def changed_paths(root: Path, configuration: RagConfig, rels: list[str]) -> list
     from bc_rag.corpus import prepare_document
     from bc_rag.discover import NxProjectIndex, source_for_path
 
-    previous = load_manifest(configuration.manifest_path(root))
-    records = previous.files if previous is not None else {}
     nx_index = NxProjectIndex(root)
     project_dir = configuration.project_dir(root)
     out: list[str] = []
+    manifests: dict[str | None, dict] = {}
     for rel in rels:
         path = root / rel
+        source = source_for_path(rel, path, configuration, nx_index=nx_index)
+        space = source.space if source is not None else None
+        if space not in manifests:
+            previous = load_manifest(configuration.manifest_path(root, space))
+            manifests[space] = previous.files if previous is not None else {}
+        records = manifests[space]
         record = records.get(rel)
         if not path.is_file():
             if record is not None:

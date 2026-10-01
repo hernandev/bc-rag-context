@@ -1,7 +1,8 @@
 from pathlib import Path
 
-from bc_rag.config import OpenApiConfig, RagConfig
+from bc_rag.config import SourceGroup
 from bc_rag.discover import classify_path, iter_source_files
+from tests.support import default_files_config, space_config
 
 
 def test_brace_globs_match_src_and_extensions() -> None:
@@ -27,7 +28,7 @@ def test_discovers_typescript_and_markdown(tmp_path: Path) -> None:
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "skip.ts").write_text("export const skip = 1;\n", encoding="utf-8")
 
-    found = {source.rel_path: source.language for source in iter_source_files(tmp_path, RagConfig())}
+    found = {source.rel_path: source.language for source in iter_source_files(tmp_path, default_files_config())}
 
     assert found["src/a.ts"] == "typescript"
     assert found["README.md"] == "markdown"
@@ -35,7 +36,9 @@ def test_discovers_typescript_and_markdown(tmp_path: Path) -> None:
 
 
 def test_package_json_is_json_when_included(tmp_path: Path) -> None:
-    configuration = RagConfig(include=["**/{package,project}.json"], openapi=OpenApiConfig(enabled=False))
+    configuration = space_config(
+        groups=[SourceGroup(name="pkg", space="prose", include=["**/{package,project}.json"])]
+    )
     relative = "libs/engine/flows/engine-flows-locations/package.json"
     path = tmp_path / relative
     path.parent.mkdir(parents=True)
@@ -47,8 +50,15 @@ def test_package_json_is_json_when_included(tmp_path: Path) -> None:
 
 
 def test_openapi_glob_loads_json_that_is_not_an_openapi_document(tmp_path: Path) -> None:
-    configuration = RagConfig(
-        openapi=OpenApiConfig(enabled=True, include=["docs/providers/_openapi/*.json"])
+    configuration = space_config(
+        groups=[
+            SourceGroup(
+                name="specs",
+                space="prose",
+                kind="openapi",
+                include=["docs/providers/_openapi/*.json"],
+            )
+        ]
     )
     relative = "docs/providers/_openapi/specs.json"
     path = tmp_path / relative

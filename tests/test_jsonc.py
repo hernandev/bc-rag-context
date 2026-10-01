@@ -7,8 +7,17 @@ def test_load_config_allows_line_comments(tmp_path: Path) -> None:
     (tmp_path / ".bc-rag.json").write_text(
         """
 {
+  "defaultSpace": "prose",
+  "spaces": {
+    "prose": {
+      "dense": {"provider": "local", "model": "jinaai/jina-embeddings-v2-base-en"},
+      "sparse": {"provider": "local", "model": "Qdrant/bm25"},
+      "rerank": {"provider": "jina", "model": "jina-reranker-v3.5"},
+      "chunk": {"max_chars": 2400, "min_chars": 40}
+    }
+  },
   "groups": [
-    { "name": "docs-bigcolony-reference", "include": ["docs/**/*.md"], "priority": 80 }
+    { "name": "docs-bigcolony-reference", "space": "prose", "include": ["docs/**/*.md"], "priority": 80 }
     // {
     //   "name": "libs-testing-mock-core-testing-mock-core-faker",
     //   "include": ["libs/testing/**/src/**/*.ts"],

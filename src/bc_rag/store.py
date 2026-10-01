@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 from bc_rag.chunking import Chunk
 from bc_rag.defaults import COLLECTION_NAME
 from bc_rag.embeddings import SparseVec
-from bc_rag.facets import SIDECAR_KEYS, parse_tag_clause
+from bc_rag.facets import SIDECAR_KEYS, is_filter_key, parse_tag_clause
 
 
 @dataclass(slots=True)
@@ -169,7 +169,7 @@ class HybridStore:
 
         if not self.client.collection_exists(self.collection):
             return
-        for key in ("group", "tags", *SIDECAR_KEYS):
+        for key in ("group", "tags", "path", *SIDECAR_KEYS):
             try:
                 self.client.create_payload_index(
                     collection_name=self.collection,
@@ -282,26 +282,65 @@ class HybridStore:
 def _payload_filter(
     *,
     groups: list[str] | None,
-    tags: list[str] | None,
+    tags: list | None,
 ):
-    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+    from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+    from bc_rag.facets import tag_branches
 
     must = []
     if groups:
         must.append(FieldCondition(key="group", match=MatchAny(any=list(groups))))
-    if tags:
-        for tag in tags:
-            if not tag:
-                continue
-            clause = parse_tag_clause(tag)
-            if clause is not None:
-                key, value = clause
-                must.append(FieldCondition(key=key, match=MatchValue(value=value)))
-            else:
-                must.append(FieldCondition(key="tags", match=MatchValue(value=tag)))
-    if not must:
-        return None
+    branches = tag_branches(tags)
+    if not branches:
+        if not must:
+            return None
+        return Filter(must=must)
+    built = [_branch_filter(branch) for branch in branches]
+    if len(built) == 1:
+        only = built[0]
+        if must:
+            only.must = [*must, *(only.must or [])]
+        return only
+    must.append(Filter(should=built))
     return Filter(must=must)
+
+
+def _branch_filter(terms: list[str]):
+    """One AND group. A leading "-" excludes that value."""
+    from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+    include: dict[str, list[str]] = {}
+    exclude: dict[str, list[str]] = {}
+    raw_include: dict[str, list[str]] = {}
+    raw_exclude: dict[str, list[str]] = {}
+    for tag in terms:
+        if not tag:
+            continue
+        negated = tag.startswith("-") and len(tag) > 1
+        body = tag[1:] if negated else tag
+        clause = parse_tag_clause(body)
+        if clause is not None:
+            key, value = clause
+            bucket = (exclude if negated else include).setdefault(key, [])
+            if value not in bucket:
+                bucket.append(value)
+            continue
+        raw_key = body.split(":", 1)[0] if ":" in body else body
+        bucket = (raw_exclude if negated else raw_include).setdefault(raw_key, [])
+        if body not in bucket:
+            bucket.append(body)
+    must = []
+    must_not = []
+    for key, values in include.items():
+        must.append(FieldCondition(key=key, match=MatchAny(any=values)))
+    for key, values in exclude.items():
+        must_not.append(FieldCondition(key=key, match=MatchAny(any=values)))
+    for values in raw_include.values():
+        must.append(FieldCondition(key="tags", match=MatchAny(any=values)))
+    for values in raw_exclude.values():
+        must_not.append(FieldCondition(key="tags", match=MatchAny(any=values)))
+    return Filter(must=must or None, must_not=must_not or None)
 
 
 def _scalar_quantization():
@@ -336,8 +375,14 @@ def _payload(chunk: Chunk) -> dict[str, Any]:
         "priority": chunk.priority,
     }
     for key, value in chunk.metadata.items():
-        if key in SIDECAR_KEYS and value:
-            payload[key] = value
+        if not value:
+            continue
+        # Older chunks stored the API route under `path`. That name is the file.
+        if key == "path":
+            key = "apiPath"
+        if key in payload or not is_filter_key(key):
+            continue
+        payload[key] = value
     return payload
 
 

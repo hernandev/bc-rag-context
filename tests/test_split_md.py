@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from bc_rag.catalog import register_project, store_dir_for_root
-from bc_rag.config import RagConfig, SourceGroup
+from bc_rag.config import SourceGroup
+from tests.support import space_config
 from bc_rag.split_md import (
     materialize_openapi_sources,
     split_rel_for,
@@ -56,7 +57,7 @@ def test_materialize_indexes_generated_markdown(tmp_path: Path) -> None:
     spec = tmp_path / "olo.json"
     _mini_spec(spec)
     register_project(tmp_path)
-    config = RagConfig(
+    config = space_config(
         groups=[
             SourceGroup(
                 name="docs-providers-_openapi-olo",
@@ -68,6 +69,7 @@ def test_materialize_indexes_generated_markdown(tmp_path: Path) -> None:
                     "provider:olo",
                     "vendor:olo",
                 ],
+                space="prose",
                 include=["olo.json"],
             )
         ]
@@ -87,3 +89,6 @@ def test_materialize_indexes_generated_markdown(tmp_path: Path) -> None:
     assert "scope:external" in expanded[0].tags
     assert "provider:olo" in expanded[0].tags
     assert "vendor:olo" in expanded[0].tags
+    # the indexer keeps only files whose space matches, so the space must survive.
+    assert expanded[0].space == "prose"
+    assert expanded[0].space == json_source.space

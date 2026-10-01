@@ -21,20 +21,26 @@ class ResetReport:
 
 def reset_targets(root: Path, configuration: RagConfig) -> list[Path]:
     project_dir = configuration.project_dir(root)
-    return [
-        configuration.store_dir(root),
-        project_dir / CORPUS_DIRNAME,
-        project_dir / OPENAPI_MD_DIRNAME,
-    ]
+    spaces: list[str] = list(configuration.spaces)
+    targets = [configuration.store_dir(root, space) for space in spaces]
+    targets.extend(
+        [
+            project_dir / CORPUS_DIRNAME,
+            project_dir / OPENAPI_MD_DIRNAME,
+        ]
+    )
+    return targets
 
 
 def reset_project(root: Path, configuration: RagConfig) -> ResetReport:
     report = ResetReport()
     url = configuration.qdrant_http_url()
-    collection = configuration.qdrant_collection(root)
-    report.collection = collection
+    spaces: list[str] = list(configuration.spaces)
+    names = [configuration.qdrant_collection(root, space) for space in spaces]
+    report.collection = names[0] if names else None
     if url:
-        _delete_http_collection(url, collection, report)
+        for collection in names:
+            _delete_http_collection(url, collection, report)
     for path in reset_targets(root, configuration):
         if not path.exists():
             report.missing.append(str(path))

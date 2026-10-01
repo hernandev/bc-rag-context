@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from bc_rag.config import RagConfig, SourceGroup
+from bc_rag.config import SourceGroup
+from tests.support import space_config
 from bc_rag.discover import iter_source_files
 from bc_rag.nx_tags import NxProjectIndex
 
@@ -20,22 +21,21 @@ def test_nx_project_json_tags_are_copied_onto_source_files(tmp_path: Path) -> No
         encoding="utf-8",
     )
     (source_dir / "index.ts").write_text("export const ok = 1;\n", encoding="utf-8")
-    configuration = RagConfig(
+    configuration = space_config(
         groups=[
-            SourceGroup(
+            SourceGroup(space="prose", 
                 name="libs-engine",
                 tags=["libs"],
                 include=["libs/engine/**/src/**/*.ts"],
                 priority=58,
             )
         ],
-        openapi={"enabled": False, "include": []},
     )
     files = list(iter_source_files(tmp_path, configuration))
     assert len(files) == 1
     assert files[0].group == "libs-engine-flows-engine-flows-locations"
     assert files[0].group == "libs-engine-flows-engine-flows-locations"
-    assert files[0].tags == ["libs"]
+    assert files[0].tags == ["group:libs-engine", "libs"]
 
 
 def test_nx_index_walks_up_to_project_json(tmp_path: Path) -> None:
@@ -77,15 +77,14 @@ def test_nx_vendor_colon_tags_are_not_copied(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (source_dir / "index.ts").write_text("export const ok = 1;\n", encoding="utf-8")
-    configuration = RagConfig(
+    configuration = space_config(
         groups=[
-            SourceGroup(
+            SourceGroup(space="prose", 
                 name="libs-vendor",
                 include=["libs/vendor/**/src/**/*.ts"],
                 priority=56,
             )
         ],
-        openapi={"enabled": False, "include": []},
     )
     files = list(iter_source_files(tmp_path, configuration))
     assert len(files) == 1

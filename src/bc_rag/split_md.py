@@ -124,8 +124,6 @@ def materialize_openapi_sources(root: Path, config, files: list[SourceFile]) -> 
                 continue
             markdowns = _endpoint_markdowns(dest)
         chunk = source.chunk
-        if chunk is not None:
-            chunk = chunk.model_copy(update={"max_chars": chunk.openapi_max_chars})
         for markdown in markdowns:
             expanded.append(
                 SourceFile(
@@ -140,6 +138,8 @@ def materialize_openapi_sources(root: Path, config, files: list[SourceFile]) -> 
                     priority=source.priority,
                     chunk=chunk,
                     embed=source.embed,
+                    space=source.space,
+                    explicit_dense=source.explicit_dense,
                 )
             )
     return expanded

@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from bc_rag.config import load_config
 from bc_rag.jina_api import (
     JinaApiError,
@@ -14,22 +16,22 @@ from bc_rag.jina_api import (
 )
 
 
-def test_use_jina_api_alias(tmp_path: Path) -> None:
+def test_use_jina_api_alias_is_rejected(tmp_path: Path) -> None:
     (tmp_path / ".bc-rag.json").write_text(
         json.dumps({"embed": {"useJinaApi": True}}),
         encoding="utf-8",
     )
-    configuration, _ = load_config(tmp_path)
-    assert configuration.embed.jina_api is True
+    with pytest.raises(ValueError, match="embed is not a config key"):
+        load_config(tmp_path)
 
 
-def test_top_level_use_jina_api(tmp_path: Path) -> None:
+def test_top_level_use_jina_api_is_rejected(tmp_path: Path) -> None:
     (tmp_path / ".bc-rag.json").write_text(
         json.dumps({"useJinaApi": True}),
         encoding="utf-8",
     )
-    configuration, _ = load_config(tmp_path)
-    assert configuration.embed.jina_api is True
+    with pytest.raises(ValueError, match="useJinaApi"):
+        load_config(tmp_path)
 
 
 def test_api_model_name_strips_fastembed_prefix() -> None:

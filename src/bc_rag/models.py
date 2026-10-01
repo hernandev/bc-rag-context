@@ -84,9 +84,12 @@ def configured_model_names(root: Path) -> list[str]:
     from bc_rag.config import load_config
 
     configuration, _ = load_config(root)
-    names = [configuration.embed.dense, configuration.embed.sparse]
-    if configuration.embed.rerank:
-        names.append(configuration.embed.rerank)
+    names: list[str] = []
+    for spec in configuration.spaces.values():
+        names.append(spec.dense_id())
+        names.append(spec.sparse.model)
+        if spec.rerank is not None:
+            names.append(spec.rerank.model)
     return names
 
 

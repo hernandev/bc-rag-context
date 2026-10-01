@@ -14,8 +14,20 @@ from pathlib import Path
 
 from bc_rag.defaults import CODE_LANGUAGES, JSON_LANGUAGE, MARKDOWN_LANGUAGES
 
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
-FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
+HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*)$")
+FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+THEMATIC_RE = re.compile(
+    r"^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$"
+)
+# Pandoc `-t plain` prints a horizontal rule as a line of hyphens, often 72,
+# and may indent it. A line that is only dashes, stars, or underscores splits.
+PLAIN_RULE_RE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})$")
+DETAILS_OPEN_RE = re.compile(r"^ {0,3}<details\b", re.IGNORECASE)
+DETAILS_CLOSE_RE = re.compile(r"^ {0,3}</details\s*>", re.IGNORECASE)
+SUMMARY_RE = re.compile(
+    r"<summary>\s*(?P<at>\d{4}-\d{2}-\d{2}T[^<\s]+)\s+-\s+(?P<role>user|agent)\s*:\s*(?P<preview>.*?)</summary>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 STRUCTURAL_TYPES: frozenset[str] = frozenset(
     {
@@ -335,23 +347,38 @@ def _bundle_children(
     return chunks
 
 
+def _leading_comment(node):
+    """Comment siblings written above a declaration belong to that declaration."""
+    start = node
+    current = node
+    while True:
+        prev = current.prev_sibling
+        if prev is None or prev.type not in ("comment", "html_comment"):
+            break
+        start = prev
+        current = prev
+    return start
+
+
 def _make_code_chunk(node, source: bytes, rel_path: str, language: str) -> Chunk:
+    start = _leading_comment(node)
     return Chunk(
         path=rel_path,
         language=language,
         kind=_kind_for(node),
         symbol=_symbol_for(node, source),
         heading_path=None,
-        start_line=node.start_point[0] + 1,
+        start_line=start.start_point[0] + 1,
         end_line=node.end_point[0] + 1,
-        start_byte=node.start_byte,
+        start_byte=start.start_byte,
         end_byte=node.end_byte,
-        text=_node_text(node, source),
+        text=source[start.start_byte : node.end_byte].decode("utf-8", errors="replace"),
     )
 
 
 def _make_span_chunk(nodes: list, source: bytes, rel_path: str, language: str) -> Chunk:
     first, last = nodes[0], nodes[-1]
+    start = _leading_comment(first)
     symbol = _symbol_for(first, source) if len(nodes) == 1 else None
     kind = _kind_for(first) if len(nodes) == 1 else "block"
     return Chunk(
@@ -360,11 +387,11 @@ def _make_span_chunk(nodes: list, source: bytes, rel_path: str, language: str) -
         kind=kind,
         symbol=symbol,
         heading_path=None,
-        start_line=first.start_point[0] + 1,
+        start_line=start.start_point[0] + 1,
         end_line=last.end_point[0] + 1,
-        start_byte=first.start_byte,
+        start_byte=start.start_byte,
         end_byte=last.end_byte,
-        text=source[first.start_byte : last.end_byte].decode("utf-8", errors="replace"),
+        text=source[start.start_byte : last.end_byte].decode("utf-8", errors="replace"),
     )
 
 
@@ -395,23 +422,71 @@ def _node_text(node, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
 
+def _opening_fence(line: str) -> tuple[str, int] | None:
+    match = FENCE_OPEN_RE.match(line.rstrip("\r\n"))
+    if match is None:
+        return None
+    marker = match.group(2)
+    info = match.group(3)
+    if marker[0] == "`" and "`" in info:
+        return None
+    return marker[0], len(marker)
+
+
+def _closing_fence(line: str, char: str, length: int) -> bool:
+    raw = line.rstrip("\r\n")
+    return re.match(rf"^ {{0,3}}{re.escape(char)}{{{length},}}\s*$", raw) is not None
+
+
 def _chunk_markdown(rel_path: str, language: str, text: str, max_chars: int) -> list[Chunk]:
     sections: list[tuple[str | None, int, list[str]]] = []
     breadcrumb: list[str] = []
     current_title: str | None = None
     current_start = 1
     current_lines: list[str] = []
-    in_fence = False
+    fence: tuple[str, int] | None = None
+    details_depth = 0
 
     lines = text.splitlines(keepends=True)
     if not lines:
         return []
 
+    def flush(at_line: int) -> None:
+        nonlocal current_title, current_start, current_lines
+        if current_lines or current_title:
+            sections.append((current_title, current_start, current_lines))
+        current_title = None
+        current_start = at_line
+        current_lines = []
+
     for index, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if FENCE_RE.match(stripped):
-            in_fence = not in_fence
-        heading = None if in_fence else HEADING_RE.match(stripped)
+        raw = line.rstrip("\r\n")
+        if fence is not None:
+            current_lines.append(line)
+            if _closing_fence(raw, fence[0], fence[1]):
+                fence = None
+            continue
+        opened = _opening_fence(line)
+        if opened is not None:
+            fence = opened
+            current_lines.append(line)
+            continue
+        if THEMATIC_RE.match(raw) or PLAIN_RULE_RE.match(raw.strip()):
+            flush(index + 1)
+            continue
+        if DETAILS_OPEN_RE.match(raw):
+            if details_depth == 0:
+                flush(index)
+            details_depth += 1
+            current_lines.append(line)
+            continue
+        if details_depth > 0 and DETAILS_CLOSE_RE.match(raw):
+            current_lines.append(line)
+            details_depth -= 1
+            if details_depth == 0:
+                flush(index + 1)
+            continue
+        heading = None if details_depth else HEADING_RE.match(raw)
         if heading is None:
             current_lines.append(line)
             continue
@@ -429,34 +504,79 @@ def _chunk_markdown(rel_path: str, language: str, text: str, max_chars: int) -> 
 
     chunks: list[Chunk] = []
     byte_cursor = 0
+    doc_title: str | None = None
+    last_user_body: str | None = None
+    last_user_summary: str | None = None
     # Recompute byte offsets from the original text by walking sections in order.
     for title, sec_start, sec_lines in sections:
         body = "".join(sec_lines)
         if not body.strip():
             byte_cursor += len(body.encode("utf-8"))
             continue
+        if title and " > " not in title and body.lstrip().startswith("# "):
+            doc_title = title
+        summary = SUMMARY_RE.search(body)
+        summary_line = ""
+        role = ""
+        at = ""
+        preview = ""
+        if summary is not None:
+            at = summary.group("at")
+            role = summary.group("role").lower()
+            preview = " ".join(summary.group("preview").split())
+            summary_line = f"<summary>{at} - {role}: {preview}</summary>"
+        heading_path = title
+        if summary is not None:
+            turn = f"{at} - {role}: {preview}"
+            heading_path = f"{doc_title} > {turn}" if doc_title else turn
         parts = _split_text(body, max_chars)
         local = 0
-        for part in parts:
+        for index, part in enumerate(parts):
+            text_out = part
+            if summary is not None and role == "agent" and last_user_body:
+                if index == 0:
+                    text_out = last_user_body.rstrip() + "\n\n" + part
+                else:
+                    lead = [summary_line]
+                    if last_user_summary:
+                        lead.append(f"User: {last_user_summary}")
+                    text_out = "\n\n".join(lead) + "\n\n" + part
+            elif index > 0 and summary_line and summary_line not in part:
+                text_out = summary_line + "\n\n" + part
             part_start_line = sec_start + body[:local].count("\n")
             part_end_line = part_start_line + max(part.count("\n"), 0)
             start_byte = byte_cursor + len(body[:local].encode("utf-8"))
             end_byte = start_byte + len(part.encode("utf-8"))
+            metadata: dict[str, str] = {}
+            tags: list[str] = []
+            if at:
+                metadata["at"] = at
+                metadata["day"] = at[:10]
+                tags.append(f"at:{at}")
+                tags.append(f"day:{at[:10]}")
+            if role:
+                metadata["role"] = role
+                tags.append(f"role:{role}")
             chunks.append(
                 Chunk(
                     path=rel_path,
                     language=language,
-                    kind="heading" if title else "prose",
-                    symbol=title.split(" > ")[-1] if title else None,
-                    heading_path=title,
+                    kind="turn" if summary is not None else ("heading" if title else "prose"),
+                    symbol=(preview or (title.split(" > ")[-1] if title else None)),
+                    heading_path=heading_path,
                     start_line=part_start_line,
                     end_line=max(part_end_line, part_start_line),
                     start_byte=start_byte,
                     end_byte=end_byte,
-                    text=part,
+                    text=text_out,
+                    tags=tags,
+                    metadata=metadata,
                 )
             )
             local += len(part)
+        if role == "user":
+            last_user_body = body
+            last_user_summary = preview
         byte_cursor += len(body.encode("utf-8"))
     return chunks
 

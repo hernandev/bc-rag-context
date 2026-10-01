@@ -55,15 +55,19 @@ OpenAPI split files need the [Redocly CLI](https://redocly.com/docs/cli) on `PAT
 ## Commands
 
 ```bash
-bc-rag init [folder]          # write .bc-rag.json (optional, defaults work)
-bc-rag index [folder]         # index. Unchanged files are skipped by sha256
-bc-rag query "how do I write overlay keys"
-bc-rag watch [folder]         # index, then rewrite only files that change or disappear
-bc-rag status [folder]
-bc-rag projects list          # catalog used by MCP
-bc-rag projects forget NAME
-bc-rag mcp                    # stdio, one chat
-bc-rag mcp --http             # one shared listener on 127.0.0.1:32323/mcp
+bc-rag init --root [folder]          # write .bc-rag.json (optional, defaults work)
+bc-rag index --root [folder]         # index. Unchanged files are skipped by sha256
+bc-rag index --all --every 5m         # every cataloged project, again every 5 minutes
+bc-rag query --query "how do I write overlay keys"
+bc-rag watch --root [folder]         # index, then rewrite only files that change or disappear
+bc-rag status --root [folder]
+bc-rag projects list                  # catalog used by MCP
+bc-rag projects forget --name NAME
+bc-rag files list --group NAME --space prose
+bc-rag mcp                            # stdio, one chat
+bc-rag mcp --http                     # one shared listener on 127.0.0.1:32323/mcp
+bc-rag config set voyage-api-key KEY  # stored in ~/.bc-rag/config
+bc-rag daemon status                  # the background indexer and MCP listener
 ```
 
 `bc-rag index` hashes each file. A later run embeds only files whose bytes changed, and deletes paths that vanished.
@@ -75,8 +79,8 @@ bc-rag mcp --http             # one shared listener on 127.0.0.1:32323/mcp
 Index each repository once:
 
 ```bash
-bc-rag index /path/to/engine
-bc-rag index /path/to/portal
+bc-rag index --root /path/to/engine
+bc-rag index --root /path/to/portal
 ```
 
 Each successful index registers the root in `~/.bc-rag/catalog.json`.
@@ -87,7 +91,15 @@ Start one shared listener, then point every client at that address. Each chat th
 bc-rag mcp --http
 ```
 
-That listens on `http://127.0.0.1:32323/mcp`. A launchd job for the same command is `contrib/launchd/ai.pleinair.bc-rag.mcp.plist`.
+That listens on `http://127.0.0.1:32323/mcp`. You rarely start it by hand: [the daemon](#the-daemon) runs it.
+
+Claude's remote MCP form asks for `https`. Issue a certificate with mkcert, then the same process also listens on `https://bc-rag.localhost:32324/mcp`:
+
+```bash
+bin/bc-rag-mcp-cert
+```
+
+That writes `~/.bc-rag/mcp.pem` and `~/.bc-rag/mcp.key` for the name `bc-rag.localhost`. `mkcert -install` has to have been run once already, so the certificate is trusted. Restart the daemon after the files appear (`bc-rag daemon restart`) so the running listener picks them up.
 
 ```json
 {
@@ -103,11 +115,46 @@ That listens on `http://127.0.0.1:32323/mcp`. A launchd job for the same command
 Tools:
 
 - `list_projects`
-- `search` — dense vectors, then rerank. Omit `project` to search every living catalog entry.
-- `search_sparse` — BM25 only. No dense vector and no rerank.
+- `search` — dense vectors, then rerank. `project` and `space` are required.
+- `search_sparse` — BM25 only. No dense vector and no rerank. `project` and `space` are required.
 - `list_tags`
 
 You do not register one MCP server per repository.
+
+## API keys
+
+Keys live in `~/.bc-rag/config`, a JSON file only you can read:
+
+```bash
+bc-rag config set voyage-api-key pa-...
+bc-rag config list                     # every setting, where it comes from, secrets masked
+bc-rag config get voyage-api-key --reveal
+bc-rag config unset voyage-api-key
+```
+
+A setting missing from that file falls back to its environment variable: `VOYAGE_AI_API_KEY` (or `VOYAGE_API_KEY`), `JINA_API_KEY`, `BC_RAG_DAEMON_INDEX_EVERY`.
+
+## The daemon
+
+Like the Nx daemon, nothing is installed. The first `bc-rag` command you run starts one background process per user, and it keeps running after the terminal closes. It runs two children and restarts either one when it exits:
+
+| Child | Command |
+|---|---|
+| index | `bc-rag index --all --every 5m` — every project in `~/.bc-rag/catalog.json` |
+| mcp | `bc-rag mcp --http` — `127.0.0.1:32323/mcp`, and `https://bc-rag.localhost:32324/mcp` when `~/.bc-rag/mcp.pem` and `mcp.key` exist |
+
+A repository joins the index the first time you run `bc-rag index --root` there. Set the interval with `bc-rag config set daemon-index-every 10m`.
+
+The daemon inherits the environment of the command that started it, so `node`, `pnpm` and `docker` come from your own PATH. When bc-rag's own source changes, the next command replaces the running daemon, so it never serves old code.
+
+```bash
+bc-rag daemon status
+bc-rag daemon restart                 # pick up a new PATH or setting
+bc-rag daemon stop
+BC_RAG_DAEMON=false bc-rag query ...  # run one command without starting it
+```
+
+The log is `~/.bc-rag/logs/daemon.log`. After a reboot the daemon is down until the next `bc-rag` command, exactly like Nx.
 
 ## Config
 
@@ -145,6 +192,28 @@ Default reranker: `jinaai/jina-reranker-v1-turbo-en` (8k context, so a whole ope
 `search` pulls dense candidates, then the reranker reorders them.
 
 `search_sparse` is BM25 only. No dense vector and no rerank. That is the path for an identifier or an exact error string.
+
+## Spaces
+
+A `.bc-rag.json` can name more than one vector space. Each group points at one space. Each space names its own dense model.
+
+A model whose name starts with `voyage-context` uses the Voyage contextual HTTP endpoint. `input` `chunks` sends this repo's chunks as one batch per file. `input` `auto` lets Voyage split the file. Every other model keeps today's embed path.
+
+`search` and `search_sparse` require `project` and `space`. A file with no `embed.spaces` has one space named `default`, and that collection name stays the one already in use.
+
+```json
+"embed": {
+  "spaces": {
+    "prose": { "dense": "voyage-context-4", "dimensions": 1024, "input": "chunks" },
+    "code": { "dense": "voyage-code-4", "dimensions": 1024 }
+  },
+  "defaultSpace": "prose"
+}
+```
+
+```json
+{ "name": "docs", "space": "prose", "include": ["docs/**/*.md"] }
+```
 
 ## Scale this is built for
 

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Issue the mkcert certificate the shared MCP listener serves over HTTPS.
+# The local CA is already trusted (`mkcert -install`). This only writes the leaf.
+# Files: ${BC_RAG_HOME:-~/.bc-rag}/mcp.pem and mcp.key.
+set -euo pipefail
+
+name="bc-rag.localhost"
+dir="${BC_RAG_HOME:-$HOME/.bc-rag}"
+cert="$dir/mcp.pem"
+key="$dir/mcp.key"
+
+if ! command -v mkcert >/dev/null 2>&1; then
+  echo "mkcert is not on PATH. Install it, then run mkcert -install once." >&2
+  exit 1
+fi
+
+mkdir -p "$dir"
+mkcert -cert-file "$cert" -key-file "$key" "$name"
+chmod 600 "$key"
+echo "certificate  $cert"
+echo "key          $key"
+echo "url          https://${name}:32324/mcp"

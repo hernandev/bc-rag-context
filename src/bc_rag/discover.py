@@ -39,6 +39,8 @@ class SourceFile:
         "priority",
         "chunk",
         "embed",
+        "space",
+        "explicit_dense",
     )
 
     def __init__(
@@ -54,6 +56,8 @@ class SourceFile:
         priority: int = 0,
         chunk: ChunkConfig | None = None,
         embed: EmbedConfig | None = None,
+        space: str | None = None,
+        explicit_dense: str | None = None,
     ) -> None:
         self.path = path
         self.rel_path = rel_path
@@ -66,6 +70,8 @@ class SourceFile:
         self.priority = priority
         self.chunk = chunk
         self.embed = embed
+        self.space = space
+        self.explicit_dense = explicit_dense
 
 
 @dataclass(slots=True)
@@ -134,6 +140,13 @@ def classify_path(
     return source.language
 
 
+def _chunk_for(config: RagConfig, primary: SourceGroup) -> ChunkConfig:
+    spec = config.space_named(primary.space)
+    if spec.chunk is None:
+        raise ValueError(f"space {primary.space!r} requires chunk")
+    return spec.chunk
+
+
 def source_for_path(
     rel: str,
     path: Path,
@@ -183,25 +196,40 @@ def source_for_path(
         group=group_name,
         config_group=primary.name,
         priority=primary.priority,
-        chunk=primary.resolved_chunk(config.chunk),
-        embed=primary.resolved_embed(config.embed) if primary.embed is not None else None,
+        chunk=_chunk_for(config, primary),
+        embed=None,
+        space=primary.space,
+        explicit_dense=None,
     )
 
 
 def iter_source_groups(
-    root: Path, config: RagConfig
+    root: Path,
+    config: RagConfig,
+    include_disabled: set[str] | None = None,
 ) -> Iterator[tuple[SourceGroup, list[SourceFile]]]:
-    """Yield one enabled group at a time, with its files already resolved."""
+    """Yield one group at a time, with its files already resolved.
+
+    Disabled groups are skipped unless their name is in `include_disabled`.
+    """
     root = root.resolve()
     nx_index = NxProjectIndex(root)
-    seen: set[str] = set()
-    groups = sorted(config.resolved_groups(), key=lambda group: (-group.priority, group.name))
+    seen: set[tuple[str, str]] = set()
+    groups = sorted(
+        config.groups or config.resolved_groups(),
+        key=lambda group: (-group.priority, group.name),
+    )
+    named = include_disabled or set()
     for group in groups:
+        if not group.enabled and group.name not in named:
+            continue
+        space_name = group.space or ""
         relative_paths = _relative_paths_for_group(root, config, group)
         relative_paths.sort()
         files: list[SourceFile] = []
         for relative_path in relative_paths:
-            if relative_path in seen:
+            key = (space_name, relative_path)
+            if key in seen:
                 continue
             path = root / relative_path
             source = source_for_path(
@@ -213,7 +241,7 @@ def iter_source_groups(
             )
             if source is None or not path.is_file():
                 continue
-            seen.add(relative_path)
+            seen.add(key)
             files.append(source)
         if files:
             yield group, files
@@ -228,6 +256,10 @@ def _merge_tags(groups: list[SourceGroup], nx_project: NxProject | None) -> list
     del nx_project
     tags: list[str] = []
     for group in groups:
+        # The config group name is a tag, so query can filter group:name like any other tag.
+        label = f"group:{group.name}"
+        if label not in tags:
+            tags.append(label)
         for item in group.tags:
             if item and item not in tags:
                 tags.append(item)

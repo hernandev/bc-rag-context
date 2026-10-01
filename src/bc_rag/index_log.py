@@ -37,6 +37,7 @@ SCROLL_EVENTS = frozenset(
         "pipeline",
         "done",
         "stopped",
+        "space",
     }
 )
 LOG_TAIL = 16
@@ -82,6 +83,8 @@ class IndexLog:
         self.queue_upsert = (0, 0)
         self._lines: deque[str] = deque(maxlen=LOG_TAIL)
         self._live: Live | None = None
+        self.space_name = ""
+        self.embed_label = ""
 
     def start(self) -> None:
         if not self.console.is_terminal:
@@ -99,6 +102,18 @@ class IndexLog:
         with self._lock:
             self.files_total = files
             self.bytes_total = nbytes
+            self._refresh()
+
+    def set_space(self, name: str) -> None:
+        """Name the space currently being written. Counters stay put."""
+        with self._lock:
+            self.space_name = name
+            self._refresh()
+
+    def set_embed_label(self, name: str) -> None:
+        """Provider name for the post panel. Voyage must not be labeled jina."""
+        with self._lock:
+            self.embed_label = name
             self._refresh()
 
     def set_queue_depth(self, name: str, size: int, maxsize: int) -> None:
@@ -222,7 +237,7 @@ class IndexLog:
     def _render(self) -> Group:
         elapsed = time.perf_counter() - self._started
         left = max(0, self.batches_total - self.batches_upserted)
-        rate = _embed_rate()
+        rate = _embed_rate(self.embed_label)
         eta = "--"
         ok_ms = float(rate.get("last_ok_ms") or self.last_post_ms or 0)
         if ok_ms and self.post_workers and left:
@@ -252,17 +267,21 @@ class IndexLog:
             ]
         )
 
-        post = _panel_text(
+        post_rows: list[tuple[str, ...]] = [
+            ("done", _slash(self.batches_posted, self.batches_total), "percent", _pct_plain(self.batches_posted, self.batches_total)),
+            ("in", _slash(self.post_inflight, self.post_workers), "q", str(int(self.queue_post[0]))),
+            ("last", _fmt_ms(rate.get("last_ok_ms") or self.last_post_ms), "chars", str(int(self.last_post_chars))),
+            ("rpm", str(int(rate.get("rpm") or 0)), "tpm", _tok(rate.get("tpm"))),
+        ]
+        if rate.get("remaining_requests") is not None or rate.get("remaining_tokens") is not None:
+            post_rows.append((self.embed_label or "api", _fmt_jina_remaining(rate)))
+        post_rows.extend(
             [
-                ("done", _slash(self.batches_posted, self.batches_total), "percent", _pct_plain(self.batches_posted, self.batches_total)),
-                ("in", _slash(self.post_inflight, self.post_workers), "q", str(int(self.queue_post[0]))),
-                ("last", _fmt_ms(rate.get("last_ok_ms") or self.last_post_ms), "chars", str(int(self.last_post_chars))),
-                ("rpm", _slash(rate.get("rpm") or 0, rate.get("rpm_cap") or 0), "tpm", f"{_tok(rate.get('tpm'))}/{_tok(rate.get('tpm_cap'))}"),
-                ("jina", _fmt_jina_remaining(rate)),
                 ("429", str(int(rate.get("retries") or 0)), "last min", str(int(rate.get("retries_min") or 0))),
                 ("cool", f"{int(rate.get('cool_s') or 0)}s", "eta", eta),
             ]
         )
+        post = _panel_text(post_rows)
 
         upsert = _panel_text(
             [
@@ -273,8 +292,9 @@ class IndexLog:
         )
 
         log = Text("\n".join(self._lines) if self._lines else "…", overflow="fold")
+        title = "bc-rag index" if not self.space_name else f"bc-rag index  {self.space_name}"
         return Group(
-            Panel(overview, title="bc-rag index", border_style="cyan"),
+            Panel(overview, title=title, border_style="cyan"),
             Columns(
                 [
                     Panel(chunk, title="chunk", border_style="blue"),
@@ -323,6 +343,14 @@ def _scroll_line(event: str, fields: dict[str, Any]) -> str:
         return f"error   {path}  {fields.get('message')}"
     if event == "deleted":
         return f"delete  {path}"
+    if event == "space":
+        name = str(fields.get("space") or "")
+        if fields.get("phase") == "end":
+            return (
+                f"space   {name}  indexed={fields.get('indexed')}  "
+                f"unchanged={fields.get('unchanged')}  errors={fields.get('errors')}"
+            )
+        return f"space   {name}  {fields.get('files')} files"
     if event == "pipeline":
         return (
             f"pipeline chunk x{fields.get('chunk_workers')}  "
@@ -522,10 +550,14 @@ def _fmt_bytes(value: object) -> str:
     return f"{size / 1024**3:.2f}GB"
 
 
-def _embed_rate() -> dict[str, Any]:
-    from bc_rag.jina_api import embed_rate_snapshot
-
+def _embed_rate(provider: str = "") -> dict[str, Any]:
     try:
+        if provider == "voyage":
+            from bc_rag.voyage_api import rate_snapshot
+
+            return rate_snapshot()
+        from bc_rag.jina_api import embed_rate_snapshot
+
         return embed_rate_snapshot()
     except Exception:
         return {
